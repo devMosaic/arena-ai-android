@@ -2,9 +2,15 @@ services:
   dev-proxy:
     build: .
     image: arena-ai-android-dev-proxy:latest
+    # Published on the host's loopback only. This proxy forwards arena.ai session cookies and
+    # has no authentication of its own, so it must not be reachable from the LAN by default.
+    # To test from a phone on the same network, change the mapping to "0.0.0.0:3000:3000"
+    # deliberately and stop the container afterwards.
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
+      # 0.0.0.0 inside the container is required for the published port to work at all;
+      # the host-side binding above is what keeps it off the LAN.
       HOST: 0.0.0.0
       PORT: "3000"
     restart: unless-stopped

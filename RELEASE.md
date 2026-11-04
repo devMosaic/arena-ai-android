@@ -54,13 +54,25 @@ APK. Nothing is ever generated in CI: a new key would break every existing insta
 
 ```bash
 npm ci
-npm test                      # 81-check audit suite
+npm test                      # 123-check audit suite
 (cd android && ./gradlew test assembleRelease)
 scripts/verify-apk.sh android/app/build/outputs/apk/release/app-release.apk
 ```
 
 Without the keystore the release APK is debug-signed; `verify-apk.sh` still checks
 signature presence, 4-byte alignment and package metadata.
+
+The audit suite does not stop at the build files: it opens `ArenaAI.apk` itself, recomputes every
+v1 (JAR) digest, walks the APK Signing Block for v2/v3 pairs, extracts the X.509 from
+`META-INF/CERT.RSA` and compares its SHA-256 with the fingerprint published here *and* the
+`EXPECTED_CERT_SHA256` pin in `release.yml`, reads the `versionName` out of the binary manifest,
+and fails if the committed artifact is neither current with the source nor explicitly disclosed as
+a historical artifact.
+
+> **Until a `v1.0.4` tag exists, `releases/latest` serves 1.0.3 to everyone** — both the README
+> install link and the in-app updater. It is also why the integrity hardening added in 1.0.4
+> (archive signature verification, blob-export limits, persisted deferred installs) is not yet
+> reachable by anyone on 1.0.3: publishing is the fix, not another source change.
 
 ---
 

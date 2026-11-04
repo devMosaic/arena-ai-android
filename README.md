@@ -18,7 +18,7 @@
   <a href="https://developer.android.com"><img src="https://img.shields.io/badge/Platform-Android_8.0+_(API_26+)-brightgreen.svg" alt="Platform"></a>
   <a href="android/"><img src="https://img.shields.io/badge/Package-ai.arena.mobile-purple.svg" alt="Package"></a>
   <a href="https://github.com/Mr-Nobody-Anonymous/arena-ai-android/releases/latest"><img src="https://img.shields.io/badge/Release-Latest-orange.svg" alt="Release"></a>
-  <a href="tests/"><img src="https://img.shields.io/badge/Audit_Tests-92%2F92_Passing-success.svg" alt="Audit Tests"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Audit_Tests-123%2F123_Passing-success.svg" alt="Audit Tests"></a>
 </p>
 
 An open-source, high-performance native Android application for **[Arena (arena.ai)](https://arena.ai)** (formerly LMSYS Chatbot Arena). This application provides a full-screen, mobile-optimized experience for crowdsourced LLM evaluation, blind pairwise model battles, multimodal vision benchmarks, live Elo leaderboards, and direct model chat.
@@ -341,6 +341,17 @@ scripts/verify-apk.sh android/app/build/outputs/apk/release/app-release.apk
 
 Neither is required by the app: the APK connects straight to `https://arena.ai`.
 
+Environment knobs for the proxy:
+
+| Variable | Default | Effect |
+| :--- | :--- | :--- |
+| `PORT` | `3000` | Port the proxy listens on |
+| `HOST` | `0.0.0.0` | Bind address. The default exists so a phone on the LAN can reach it, and the proxy prints a warning whenever it is not loopback — use `HOST=127.0.0.1` plus an SSH tunnel or an mDNS/VPN address if you do not want it open to the network |
+| `ALLOWED_HOSTS` | loopback only | Extra `Host` headers to accept while bound to loopback (comma-separated, e.g. `ALLOWED_HOSTS=proxy.local,192.168.1.20:3000`). Requests with any other `Host` get **403**, which is what stops a DNS-rebinding attack against a developer machine. Requests bound to a LAN address are not pinned, because the QR-code flow needs arbitrary host:port |
+
+`docker compose` publishes `127.0.0.1:3000:3000`, so a containerised run is loopback-only unless you
+change that mapping.
+
 ### Release process
 
 Building, verifying and publishing a signed release is documented step by step in
@@ -348,7 +359,17 @@ Building, verifying and publishing a signed release is documented step by step i
 pre-flight `./scripts/release-check.sh`.
 
 ### Automated Compliance Test Suite
-The repository ships an automated audit suite that covers architecture, security hardening, the native capability bridge, update integrity, release engineering, the shipped APK artifact (checksum, zip alignment, v2 signature block) and the development server endpoints:
+The repository ships an automated audit suite (123 checks) covering architecture, security
+hardening, the native capability bridge, update integrity, release engineering, the development
+server endpoints and the shipped APK **artifact itself** — parsed from bytes rather than from build
+files: its SHA-256 against `SHA256SUMS`, every v1 (JAR) digest recomputed against the archive, the
+signing certificate extracted from `META-INF/CERT.RSA` and compared with both the README
+fingerprint and the `release.yml` pin, the APK Signing Block's scheme IDs (v2 vs. v3), the
+`versionName` inside the binary AndroidManifest, and whether the committed binary matches the
+source or is explicitly *disclosed* as a historical artifact. What the published APK is missing
+relative to the source is printed as a loud warning rather than hidden behind a green check; the
+total the documents quote is gated in `tests/runner.js`, so a stale count fails the run.
+
 ```bash
 npm test
 ```
@@ -431,11 +452,13 @@ Honest limitations of the current build — none of them adds UI, all are tracke
 | Google sign-in | Google blocks OAuth inside embedded WebViews (`disallowed_useragent`). The UA shim helps but cannot guarantee it | Use email/password, or sign in through the browser |
 | Voice / camera web APIs | No `RECORD_AUDIO` / `CAMERA` permission is declared, so `getUserMedia` prompts are denied. `capture` uploads use the **system camera app** instead | Upload a recorded file, or use the app's file picker |
 | Incoming links | No deep links: an `arena.ai` link from another app opens the browser. Doing this safely requires `assetlinks.json` on `arena.ai`, which this project does not control | Use the in-app share sheet |
-| Pull-to-refresh | Arms only after the page reports it is at the top. If Arena moves its scrollers into shadow DOM or an iframe, the gesture stays disabled (never the reverse) | Pull again after the page settles, or reopen the app |
+| Pull-to-refresh | On Arena pages it arms only after the page reports it is at the top, so a page that moves its scrollers into shadow DOM or an iframe keeps the gesture disabled (never the reverse). Non-Arena allow-listed pages use the ordinary root-scroll check | Pull again after the page settles, or reopen the app |
 | Updates with no checksum | A release without `SHA256SUMS` and without a GitHub asset digest is refused by design (`MISSING_HASH`) | Always publish through `release.yml` |
 | Update checks | At most one per 15 minutes; failures retry after 5 minutes. A shared/rate-limited IP can make checks fail quietly | Wait, or download the APK from the releases page |
-| Large `blob:` exports | In-page export is capped at ~64 MB of base64 (~48 MB file) and 30 s | Use a smaller export |
+| Large `blob:` exports | In-page export is capped at 48 MB of blob and 30 s; the limit is applied before the base64 copy is built, so an oversized export fails cleanly instead of pressuring the renderer | Use a smaller export |
 | OAuth popups | Tracked and torn down correctly, but some providers still refuse embedded WebViews | Sign in via the browser |
+| Nested popups | A popup window cannot open a popup of its own (`onCreateWindow` returns false inside a popup), so a provider that chains `window.open` twice stops at the second step | Complete that sign-in in the browser |
+| Update prompt cadence | `promptShownThisSession` means one prompt per app process: **Later** is honoured until you restart, not until the next page load | Restart the app, or install from the releases page |
 | Toolchain | `compileSdk`/`targetSdk` 35, minSdk 26. Android 15 edge-to-edge is handled with inset padding; older devices are unaffected | — |
 
 Not verifiable from CI: on-device behaviour of the WebView page itself (camera handoff,

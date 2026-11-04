@@ -83,7 +83,7 @@ final class UpdateVerifier {
         }
 
         PackageManager packageManager = context.getPackageManager();
-        PackageInfo archive = getArchiveInfo(packageManager, apkFile);
+        PackageInfo archive = getArchiveInfo(packageManager, apkFile, true);
         if (archive == null) {
             return new Result(Reason.PARSE_ERROR, "not an APK");
         }
@@ -100,6 +100,15 @@ final class UpdateVerifier {
         }
 
         List<String> archiveCertificates = certificateDigests(archive);
+        if (archiveCertificates.isEmpty()) {
+            // getPackageArchiveInfo() populates SigningInfo inconsistently: on several OEM
+            // builds it comes back empty for an archive even though the JAR signature is
+            // present, which would refuse *every* update on those devices. Retry with the
+            // pre-P flag before concluding anything about the signer, so a platform quirk
+            // cannot be mistaken for a mismatch.
+            PackageInfo legacy = getArchiveInfo(packageManager, apkFile, false);
+            archiveCertificates = certificateDigests(legacy);
+        }
         List<String> installedCertificates = certificateDigests(getInstalledInfo(context));
         if (archiveCertificates.isEmpty() || installedCertificates.isEmpty()) {
             return new Result(Reason.SIGNER_MISMATCH, "missing certificates");
@@ -128,10 +137,18 @@ final class UpdateVerifier {
         }
     }
 
+    /**
+     * Scans the downloaded archive.
+     *
+     * @param preferSigningCertificates {@code true} to ask for the API 28+
+     *                                    {@code SigningInfo}, {@code false} to fall back to the
+     *                                    legacy {@code signatures} array.
+     */
     @SuppressWarnings("deprecation")
-    private static PackageInfo getArchiveInfo(PackageManager packageManager, File apkFile) {
+    private static PackageInfo getArchiveInfo(PackageManager packageManager, File apkFile,
+                                              boolean preferSigningCertificates) {
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && preferSigningCertificates) {
                 return packageManager.getPackageArchiveInfo(
                         apkFile.getAbsolutePath(), PackageManager.GET_SIGNING_CERTIFICATES);
             }
@@ -172,14 +189,14 @@ final class UpdateVerifier {
             return Collections.emptyList();
         }
         Signature[] signatures = null;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && info.signingInfo != null) {
             SigningInfo signingInfo = info.signingInfo;
-            if (signingInfo != null) {
-                signatures = signingInfo.hasMultipleSigners()
-                        ? signingInfo.getApkContentsSigners()
-                        : signingInfo.getSigningCertificateHistory();
-            }
-        } else {
+            signatures = signingInfo.hasMultipleSigners()
+                    ? signingInfo.getApkContentsSigners()
+                    : signingInfo.getSigningCertificateHistory();
+        }
+        if (signatures == null || signatures.length == 0) {
+            // Pre-P path, and the archive case where SigningInfo was handed back empty.
             signatures = info.signatures;
         }
         if (signatures == null || signatures.length == 0) {

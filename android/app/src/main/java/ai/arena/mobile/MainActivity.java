@@ -6,6 +6,7 @@ import android.app.Dialog;
 import android.content.ActivityNotFoundException;
 import android.content.ClipData;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
@@ -59,6 +60,7 @@ import androidx.webkit.WebViewFeature;
 import org.json.JSONObject;
 
 import java.io.File;
+import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
@@ -216,6 +218,16 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean pageLoading = true;
     private volatile boolean viewportTrackingAvailable = false;
 
+    /**
+     * Whether the document currently on screen is an Arena origin, i.e. whether the
+     * viewport shim was injected there at all. On any other allow-listed host
+     * (an OAuth provider, a docs page) no shim runs, so {@link #pageAtTop} would never
+     * be updated and the refresh gesture would be permanently dead; those pages scroll
+     * the root document and are handled with the native {@code getScrollY()} check
+     * instead (see {@link #canPullToRefresh()}).
+     */
+    private volatile boolean currentPageInternal = false;
+
     private final Handler retryHandler = new Handler(Looper.getMainLooper());
     private final ExecutorService networkExecutor = Executors.newSingleThreadExecutor();
 
@@ -225,10 +237,16 @@ public class MainActivity extends AppCompatActivity {
     private ValueCallback<Uri[]> filePathCallback;
     private ActivityResultLauncher<Intent> fileChooserLauncher;
 
+    /** Last insets applied to {@link #rootLayout}, so fullscreen can restore them exactly. */
+    @Nullable
+    private Insets lastSystemBarInsets;
+
     /** Camera capture target created for {@code <input type="file" capture>} requests. */
     private Uri pendingCameraUri;
     private File pendingCameraFile;
-    private String pendingCameraMime;
+
+    /** Scratch directory for {@code <input capture>} stills; pruned at every launch. */
+    private static final String CAMERA_CAPTURE_DIR = "captures";
 
     /** Secondary OAuth / SSO windows, tracked so they can always be torn down. */
     private final Map<Dialog, WebView> popupWindows = new HashMap<>();
@@ -236,6 +254,14 @@ public class MainActivity extends AppCompatActivity {
     /** Fullscreen HTML5 video surface. */
     private View fullscreenView;
     private WebChromeClient.CustomViewCallback fullscreenCallback;
+
+    /**
+     * Last system-bar/cutout insets handed to the shell. {@code exitFullscreen()} restores
+     * them directly because {@code requestApplyInsets()} is only a request: if nothing has
+     * changed, the listener never runs again and the page stays under the status bar.
+     */
+    @Nullable
+    private Insets lastSystemBarInsets;
 
     private final Runnable retryRunnable = new Runnable() {
         @Override
@@ -246,35 +272,46 @@ public class MainActivity extends AppCompatActivity {
             if (networkExecutor.isShutdown()) {
                 return;
             }
+            // Reachable-for-the-duration-of-the-probe only: the socket can block for 5 s and
+            // HttpURLConnection does not respond to the interrupt from shutdownNow(), so a
+            // strong capture here would keep the destroyed activity (and its WebView) alive for
+            // the whole probe.
+            final WeakReference<MainActivity> self = new WeakReference<>(this);
             networkExecutor.execute(() -> {
                 boolean reachable = false;
+                HttpURLConnection conn = null;
                 try {
-                    URL url = new URL(ARENA_HOME_URL);
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+                    conn = (HttpURLConnection) new URL(ARENA_HOME_URL).openConnection();
                     conn.setConnectTimeout(2500);
                     conn.setReadTimeout(2500);
                     conn.setRequestMethod("HEAD");
-                    int code = conn.getResponseCode();
-                    reachable = (code > 0);
-                    conn.disconnect();
+                    reachable = conn.getResponseCode() > 0;
                 } catch (Exception ignored) {
                     reachable = false;
+                } finally {
+                    if (conn != null) {
+                        try {
+                            conn.disconnect();
+                        } catch (Exception ignored) {
+                        }
+                    }
                 }
 
                 final boolean isReachable = reachable;
                 runOnUiThread(() -> {
-                    if (destroyed || !isOfflineState) {
+                    MainActivity host = self.get();
+                    if (host == null || host.destroyed || !host.isOfflineState) {
                         return;
                     }
                     if (isReachable) {
-                        retryDelayMs = INITIAL_RETRY_DELAY_MS;
-                        isOfflineState = false;
-                        if (webView != null) {
-                            webView.loadUrl(ARENA_HOME_URL);
+                        host.retryDelayMs = INITIAL_RETRY_DELAY_MS;
+                        host.isOfflineState = false;
+                        if (host.webView != null) {
+                            host.webView.loadUrl(ARENA_HOME_URL);
                         }
                     } else {
-                        retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_DELAY_MS);
-                        scheduleNetworkRetry();
+                        host.retryDelayMs = Math.min(host.retryDelayMs * 2, MAX_RETRY_DELAY_MS);
+                        host.scheduleNetworkRetry();
                     }
                 });
             });
@@ -341,6 +378,10 @@ public class MainActivity extends AppCompatActivity {
 
         setContentView(rootLayout);
         applySystemBarInsets();
+
+        // Any leftover camera stills belong to a previous session; the WebView has
+        // already read (or abandoned) them, so they must not accumulate in the cache.
+        pruneStaleCameraCaptures();
 
         configureWebView(webView);
 
@@ -465,6 +506,7 @@ public class MainActivity extends AppCompatActivity {
                 // Until the freshly loaded page reports its own scroll position, pulling
                 // down must not reload anything.
                 pageAtTop = false;
+                currentPageInternal = url != null && isInternalHost(Uri.parse(url).getHost());
             }
 
             @Override
@@ -498,15 +540,6 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
-            @SuppressWarnings("deprecation")
-            @Override
-            public void onReceivedError(WebView wv, int errorCode, String description, String failingUrl) {
-                super.onReceivedError(wv, errorCode, description, failingUrl);
-                swipeRefreshLayout.setRefreshing(false);
-                pageLoading = false;
-                pageAtTop = false;
-                handleNetworkError();
-            }
 
             @Override
             public void onReceivedHttpError(WebView wv, WebResourceRequest request, WebResourceResponse errorResponse) {
@@ -579,37 +612,87 @@ public class MainActivity extends AppCompatActivity {
      * Opens a URI in the corresponding system app (mail, dialer, maps, Play Store,
      * {@code intent://} deep links, ...). Falls back to the link's
      * {@code browser_fallback_url} when nothing can handle it.
+     *
+     * <p>{@code intent://} URIs are parsed with {@link Intent#URI_INTENT_SCHEME}, which
+     * lets the page name an explicit {@code component=} target. Launching that verbatim is
+     * the classic WebView intent-redirection primitive: page content could aim an
+     * attacker-chosen action at any exported activity on the device, and categories are not
+     * matched for explicit intents, so adding {@code CATEGORY_BROWSABLE} alone would not
+     * stop it. The component, selector and package are therefore stripped (see
+     * {@link #toBrowsableIntent}), leaving an implicit browsable intent that only genuine
+     * browser or deep-link filters can resolve.
      */
     private void openExternal(@Nullable Uri uri) {
         if (uri == null) {
             return;
         }
-        try {
-            Intent intent;
-            if ("intent".equalsIgnoreCase(uri.getScheme())) {
-                intent = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
-            } else {
-                intent = new Intent(Intent.ACTION_VIEW, uri);
-            }
-            intent.addCategory(Intent.CATEGORY_BROWSABLE);
-            startActivity(intent);
-        } catch (Exception firstFailure) {
-            String fallbackUrl = null;
+        boolean intentScheme = "intent".equalsIgnoreCase(uri.getScheme());
+        Intent intent = intentScheme ? toBrowsableIntent(uri) : new Intent(Intent.ACTION_VIEW, uri);
+        if (intent != null) {
             try {
-                if ("intent".equalsIgnoreCase(uri.getScheme())) {
-                    Intent parsed = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
-                    fallbackUrl = parsed.getStringExtra("browser_fallback_url");
-                }
+                intent.addCategory(Intent.CATEGORY_BROWSABLE);
+                startActivity(intent);
+                return;
+            } catch (Exception ignored) {
+                // Fall through to the browser_fallback_url below.
+            }
+        }
+
+        Uri fallback = intentScheme ? readBrowserFallbackUrl(uri) : null;
+        if (fallback != null) {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, fallback));
+                return;
             } catch (Exception ignored) {
             }
-            if (fallbackUrl != null) {
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(fallbackUrl)));
-                    return;
-                } catch (Exception ignored) {
-                }
+        }
+        Toast.makeText(this, R.string.external_link_unavailable, Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * Turns an {@code intent://} URI into an <em>implicit</em> intent: whatever component,
+     * selector or package the page tried to pin is removed before it can be launched.
+     *
+     * @return the intent to launch, or {@code null} if the URI could not be parsed.
+     */
+    @Nullable
+    private Intent toBrowsableIntent(Uri uri) {
+        try {
+            Intent parsed = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
+            parsed.setComponent(null);
+            parsed.setSelector(null);
+            parsed.setPackage(null);
+            return parsed;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Extracts {@code browser_fallback_url} from an {@code intent://} URI, accepting only a
+     * plain http(s) target so a failed deep link can never smuggle in another intent, a
+     * {@code file://} path or a content provider URI.
+     */
+    @Nullable
+    private Uri readBrowserFallbackUrl(Uri uri) {
+        try {
+            Intent parsed = Intent.parseUri(uri.toString(), Intent.URI_INTENT_SCHEME);
+            String fallback = parsed.getStringExtra("browser_fallback_url");
+            if (fallback == null || fallback.trim().isEmpty()) {
+                return null;
             }
-            Toast.makeText(this, R.string.external_link_unavailable, Toast.LENGTH_SHORT).show();
+            Uri candidate = Uri.parse(fallback.trim());
+            String scheme = candidate.getScheme();
+            if (scheme == null) {
+                return null;
+            }
+            String lower = scheme.toLowerCase(Locale.US);
+            if (!lower.equals("https") && !lower.equals("http")) {
+                return null;
+            }
+            return candidate;
+        } catch (Exception ignored) {
+            return null;
         }
     }
 
@@ -799,6 +882,13 @@ public class MainActivity extends AppCompatActivity {
         }
         fullscreenView = null;
         if (rootLayout != null) {
+            // Re-apply the cached insets directly: requestApplyInsets() is only a request,
+            // and if the inset values have not changed the listener may never run again,
+            // which would leave the page permanently under the status bar after a video.
+            Insets bars = lastSystemBarInsets;
+            if (bars != null) {
+                rootLayout.setPadding(bars.left, bars.top, bars.right, bars.bottom);
+            }
             ViewCompat.requestApplyInsets(rootLayout);
         }
         if (swipeRefreshLayout != null) {
@@ -923,6 +1013,7 @@ public class MainActivity extends AppCompatActivity {
         if (popup != null) {
             try {
                 popup.stopLoading();
+                DownloadHandler.onWebViewDestroyed(popup);
                 popup.destroy();
             } catch (Exception ignored) {
             }
@@ -937,12 +1028,16 @@ public class MainActivity extends AppCompatActivity {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
             return;
         }
+        // Must cover every host in INTERNAL_HOST_SUFFIXES: the shims are injected on those
+        // pages, and a page whose origin is not registered here gets no bridge object, so
+        // both shims bail out and pull-to-refresh silently dies on that host.
         Set<String> origins = new HashSet<>(Arrays.asList(
                 "https://arena.ai",
                 "https://*.arena.ai",
                 "https://lmarena.ai",
                 "https://*.lmarena.ai",
-                "https://chat.lmsys.org"
+                "https://lmsys.org",
+                "https://*.lmsys.org"
         ));
         try {
             WebViewCompat.addWebMessageListener(view, "arenaAndroid", origins,
@@ -970,7 +1065,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void injectPageShims(WebView view, String url) {
         Uri uri = Uri.parse(url);
-        if (uri.getHost() == null || !isInternalHost(uri.getHost())) {
+        String host = uri.getHost();
+        currentPageInternal = host != null && isInternalHost(host);
+        if (!currentPageInternal) {
             return;
         }
         try {
@@ -1072,7 +1169,7 @@ public class MainActivity extends AppCompatActivity {
 
     private Intent createCameraIntent() {
         try {
-            File dir = new File(getCacheDir(), "captures");
+            File dir = new File(getCacheDir(), CAMERA_CAPTURE_DIR);
             if (!dir.exists() && !dir.mkdirs()) {
                 return null;
             }
@@ -1091,7 +1188,6 @@ public class MainActivity extends AppCompatActivity {
 
             pendingCameraUri = outputUri;
             pendingCameraFile = photo;
-            pendingCameraMime = "image/jpeg";
             return capture;
         } catch (Exception ignored) {
             return null;
@@ -1099,24 +1195,28 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void deliverFileChooserResult(int resultCode, @Nullable Intent data) {
+        // Claim the pending still first. The previous version nulled the fields and only then
+        // asked the cleanup helper to delete, which re-read those (now null) fields and so
+        // never deleted anything; the delete now works on the captured locals.
+        Uri cameraUri = pendingCameraUri;
+        File cameraFile = pendingCameraFile;
+        pendingCameraUri = null;
+        pendingCameraFile = null;
+
         if (filePathCallback == null) {
-            cleanupCameraCapture(false);
+            deleteCameraCapture(cameraUri, cameraFile);
             return;
         }
 
         Uri[] results = null;
         boolean ok = resultCode == Activity.RESULT_OK;
 
-        Uri cameraUri = pendingCameraUri;
-        File cameraFile = pendingCameraFile;
-        pendingCameraUri = null;
-        pendingCameraFile = null;
-        pendingCameraMime = null;
-
         if (ok && cameraUri != null && cameraFile != null && cameraFile.exists() && cameraFile.length() > 0) {
+            // Keep the file: the renderer reads the content:// URI lazily, after this
+            // callback returns. pruneStaleCameraCaptures() reclaims it at the next launch.
             results = new Uri[]{cameraUri};
         } else {
-            cleanupCameraCapture(true);
+            deleteCameraCapture(cameraUri, cameraFile);
             if (ok && data != null) {
                 ClipData clipData = data.getClipData();
                 if (clipData != null && clipData.getItemCount() > 0) {
@@ -1135,28 +1235,62 @@ public class MainActivity extends AppCompatActivity {
             }
         }
 
-        filePathCallback.onReceiveValue(results);
-        filePathCallback = null;
+        try {
+            filePathCallback.onReceiveValue(results);
+        } finally {
+            filePathCallback = null;
+        }
     }
 
-    private void cleanupCameraCapture(boolean delete) {
-        Uri uri = pendingCameraUri;
-        File file = pendingCameraFile;
-        pendingCameraUri = null;
-        pendingCameraFile = null;
-        pendingCameraMime = null;
-        if (delete && file != null) {
+    private void deleteCameraCapture(@Nullable Uri uri, @Nullable File file) {
+        if (file != null) {
             try {
+                // Removing the file also drops the FileProvider grant with it, so there is
+                // no need to go through the ContentResolver as well.
                 if (file.exists()) {
                     file.delete();
                 }
             } catch (Exception ignored) {
             }
-        } else if (delete && uri != null) {
+            return;
+        }
+        if (uri != null) {
             try {
                 getContentResolver().delete(uri, null, null);
             } catch (Exception ignored) {
             }
+        }
+    }
+
+    /**
+     * Drops a capture that was never delivered (cancelled chooser, destroyed activity).
+     */
+    private void discardPendingCameraCapture() {
+        Uri uri = pendingCameraUri;
+        File file = pendingCameraFile;
+        pendingCameraUri = null;
+        pendingCameraFile = null;
+        deleteCameraCapture(uri, file);
+    }
+
+    /**
+     * Removes camera stills left behind by earlier sessions. A capture handed to the
+     * WebView has to stay on disk until the page has read it, so it cannot be deleted when
+     * the chooser returns; pruning at launch is what bounds {@code cache/captures/}.
+     */
+    private void pruneStaleCameraCaptures() {
+        try {
+            File[] stale = new File(getCacheDir(), CAMERA_CAPTURE_DIR).listFiles();
+            if (stale == null) {
+                return;
+            }
+            for (File file : stale) {
+                try {
+                    file.delete();
+                } catch (Exception ignored) {
+                }
+            }
+        } catch (Exception ignored) {
         }
     }
 
@@ -1165,21 +1299,13 @@ public class MainActivity extends AppCompatActivity {
             filePathCallback.onReceiveValue(null);
             filePathCallback = null;
         }
-        cleanupCameraCapture(true);
+        discardPendingCameraCapture();
     }
 
     // ---------------------------------------------------------------------------------
     // Connectivity
     // ---------------------------------------------------------------------------------
 
-    /**
-     * Whether the pull-down gesture may start a refresh right now.
-     *
-     * <p>The reconnect screen always allows it (the gesture means "retry now"); a real page
-     * must have finished loading and reported that it is scrolled to the very top. The
-     * native {@code getScrollY()} check is a cheap belt-and-braces guard for pages that
-     * scroll the root document.
-     */
     /**
      * Android 15 (targetSdk 35) draws every app edge-to-edge and ignores the legacy
      * status/navigation bar colours. Padding the shell with the system-bar and cutout
@@ -1194,12 +1320,22 @@ public class MainActivity extends AppCompatActivity {
             Insets bars = windowInsets.getInsets(
                     WindowInsetsCompat.Type.systemBars()
                             | WindowInsetsCompat.Type.displayCutout());
+            lastSystemBarInsets = bars;
             view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
             return windowInsets;
         });
         ViewCompat.requestApplyInsets(rootLayout);
     }
 
+    /**
+     * Whether the pull-down gesture may start a refresh right now.
+     *
+     * <p>The reconnect screen always allows it (the gesture means "retry now"). An Arena
+     * page must have finished loading and reported that the document <em>and</em> every
+     * visible nested scroller sit at the top. Any other allow-listed page is checked
+     * natively instead, and {@code getScrollY() <= 0} is a cheap belt-and-braces guard in
+     * both cases.
+     */
     private boolean canPullToRefresh() {
         WebView view = webView;
         if (view == null || destroyed) {
@@ -1208,10 +1344,18 @@ public class MainActivity extends AppCompatActivity {
         if (isOfflineState) {
             return true;
         }
-        return viewportTrackingAvailable
-                && !pageLoading
-                && pageAtTop
-                && view.getScrollY() <= 0;
+        if (pageLoading) {
+            return false;
+        }
+        if (!currentPageInternal || !viewportTrackingAvailable) {
+            // No shim runs on a foreign (OAuth / docs) page and older WebView engines
+            // cannot host the bridge at all, so nothing can report the scroll state of
+            // nested scrollers. Those pages scroll the root document, which is exactly
+            // what getScrollY() observes; the reload bug lived in Arena's nested
+            // scrollers, where the native check is unreliable and the shim is used.
+            return view.getScrollY() <= 0;
+        }
+        return pageAtTop && view.getScrollY() <= 0;
     }
 
     private void handleNetworkError() {
@@ -1287,6 +1431,9 @@ public class MainActivity extends AppCompatActivity {
             if (parent != null) {
                 parent.removeView(crashedView);
             }
+            // The renderer took any in-flight blob export down with it; release the
+            // DownloadHandler claim so the next download is not blocked forever.
+            DownloadHandler.onWebViewDestroyed(crashedView);
             crashedView.destroy();
         } catch (Exception ignored) {
         }
@@ -1308,6 +1455,24 @@ public class MainActivity extends AppCompatActivity {
     // ---------------------------------------------------------------------------------
     // Lifecycle
     // ---------------------------------------------------------------------------------
+
+    /**
+     * {@code fontScale} and {@code density} are listed in {@code android:configChanges}, so
+     * the activity is deliberately not recreated when the user changes the system font size
+     * (recreating would throw away the running page). That also means nothing would pick the
+     * new scale up, so textZoom is recomputed here.
+     */
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        WebView view = webView;
+        if (view != null) {
+            view.getSettings().setTextZoom(systemFontZoom());
+        }
+        if (rootLayout != null) {
+            ViewCompat.requestApplyInsets(rootLayout);
+        }
+    }
 
     @Override
     protected void onSaveInstanceState(Bundle outState) {
@@ -1350,6 +1515,9 @@ public class MainActivity extends AppCompatActivity {
         destroyed = true;
         retryHandler.removeCallbacks(retryRunnable);
 
+        // The updater keeps its progress dialog in a static field; it must not outlive us.
+        AppUpdateManager.onActivityDestroyed(this);
+
         exitFullscreen();
         cancelFileChooser();
 
@@ -1364,6 +1532,7 @@ public class MainActivity extends AppCompatActivity {
                     ((ViewGroup) webView.getParent()).removeView(webView);
                 }
                 webView.stopLoading();
+                DownloadHandler.onWebViewDestroyed(webView);
                 webView.destroy();
             } catch (Exception ignored) {
             }

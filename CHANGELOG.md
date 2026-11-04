@@ -23,6 +23,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Blob URLs are injected as a properly escaped JavaScript string literal**
   (`toJavaScriptStringLiteral`), replacing hand-rolled `'`/`\` escaping that could produce a
   script which fails to compile and silently cancels the export.
+- **A permitted download no longer needs several times its own size in heap.** The base64 payload
+  used to be copied out of the incoming `String` with `substring()` and then decoded into a fresh
+  `byte[]`, so a 48 MB export peaked at roughly 240 MB of live allocation — past the default
+  per-app limit on many devices, i.e. an out-of-memory kill at a size the ceiling explicitly
+  allows. The payload is now decoded straight from the region of the original string
+  (`AsciiRegionStream` + `Base64.getMimeDecoder().wrap`) into the destination through one reusable
+  64 KB buffer, which also enforces the ceiling while copying.
+- **A failed MediaStore write no longer leaves a pending row behind.** If opening the stream or
+  copying throws, the half-created `Downloads` entry is deleted instead of staying as a
+  zero-length file the user never asked to keep.
 
 ### Fixed — self-updater
 
@@ -89,7 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — tests, tooling and documents
 
-- **Audit suite: 92 → 123 checks, and Suite 10 now reads the artifact instead of the build
+- **Audit suite: 92 → 127 checks, and Suite 10 now reads the artifact instead of the build
   files.** It parses the committed APK's zip central directory, recomputes every v1 (JAR) digest,
   extracts the signing certificate from the PKCS#7 blob and compares its SHA-256 against the
   README fingerprint *and* the `release.yml` pin, reads the `versionName` out of the binary
@@ -113,6 +123,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on `127.0.0.1` only. A LAN bind now prints an explicit warning.
 - Corrected stale toolchain/version claims in `CHANGELOG` context, `REPO_GAP_ANALYSIS.md` and
   `README.md` (Gradle **8.14.6** / AGP **8.13.2**, lock at `1.0.4`, 48 strings).
+- **The suite resolves resource names itself.** `aapt` does it at build time and this environment
+  has no JVM, so a new check re-implements the resolution: every `R.<type>.<name>` in the four Java
+  sources and every `@<type>/<name>` in the manifest has to exist under `res/`. Verified to fail on
+  a deliberately dangling reference before it was kept.
 
 ## [1.0.4] - 2026-10-18
 

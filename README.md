@@ -18,7 +18,7 @@
   <a href="https://developer.android.com"><img src="https://img.shields.io/badge/Platform-Android_8.0+_(API_26+)-brightgreen.svg" alt="Platform"></a>
   <a href="android/"><img src="https://img.shields.io/badge/Package-ai.arena.mobile-purple.svg" alt="Package"></a>
   <a href="https://github.com/Mr-Nobody-Anonymous/arena-ai-android/releases/latest"><img src="https://img.shields.io/badge/Release-Latest-orange.svg" alt="Release"></a>
-  <a href="tests/"><img src="https://img.shields.io/badge/Audit_Tests-123%2F123_Passing-success.svg" alt="Audit Tests"></a>
+  <a href="tests/"><img src="https://img.shields.io/badge/Audit_Tests-127%2F127_Passing-success.svg" alt="Audit Tests"></a>
 </p>
 
 An open-source, high-performance native Android application for **[Arena (arena.ai)](https://arena.ai)** (formerly LMSYS Chatbot Arena). This application provides a full-screen, mobile-optimized experience for crowdsourced LLM evaluation, blind pairwise model battles, multimodal vision benchmarks, live Elo leaderboards, and direct model chat.
@@ -359,7 +359,7 @@ Building, verifying and publishing a signed release is documented step by step i
 pre-flight `./scripts/release-check.sh`.
 
 ### Automated Compliance Test Suite
-The repository ships an automated audit suite (123 checks) covering architecture, security
+The repository ships an automated audit suite (127 checks) covering architecture, security
 hardening, the native capability bridge, update integrity, release engineering, the development
 server endpoints and the shipped APK **artifact itself** — parsed from bytes rather than from build
 files: its SHA-256 against `SHA256SUMS`, every v1 (JAR) digest recomputed against the archive, the
@@ -455,7 +455,7 @@ Honest limitations of the current build — none of them adds UI, all are tracke
 | Pull-to-refresh | On Arena pages it arms only after the page reports it is at the top, so a page that moves its scrollers into shadow DOM or an iframe keeps the gesture disabled (never the reverse). Non-Arena allow-listed pages use the ordinary root-scroll check | Pull again after the page settles, or reopen the app |
 | Updates with no checksum | A release without `SHA256SUMS` and without a GitHub asset digest is refused by design (`MISSING_HASH`) | Always publish through `release.yml` |
 | Update checks | At most one per 15 minutes; failures retry after 5 minutes. A shared/rate-limited IP can make checks fail quietly | Wait, or download the APK from the releases page |
-| Large `blob:` exports | In-page export is capped at 48 MB of blob and 30 s; the limit is applied before the base64 copy is built, so an oversized export fails cleanly instead of pressuring the renderer | Use a smaller export |
+| Large `blob:` exports | In-page export is capped at 48 MB of blob and 30 s; the limit is applied before the base64 copy is built, and the payload is then streamed to Downloads through a 64 KB buffer instead of being decoded into memory, so a permitted export does not multiply its own size on the Java heap | Use a smaller export |
 | OAuth popups | Tracked and torn down correctly, but some providers still refuse embedded WebViews | Sign in via the browser |
 | Nested popups | A popup window cannot open a popup of its own (`onCreateWindow` returns false inside a popup), so a provider that chains `window.open` twice stops at the second step | Complete that sign-in in the browser |
 | Update prompt cadence | `promptShownThisSession` means one prompt per app process: **Later** is honoured until you restart, not until the next page load | Restart the app, or install from the releases page |

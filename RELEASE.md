@@ -54,7 +54,7 @@ APK. Nothing is ever generated in CI: a new key would break every existing insta
 
 ```bash
 npm ci
-npm test                      # 123-check audit suite
+npm test                      # 127-check audit suite
 (cd android && ./gradlew test assembleRelease)
 scripts/verify-apk.sh android/app/build/outputs/apk/release/app-release.apk
 ```

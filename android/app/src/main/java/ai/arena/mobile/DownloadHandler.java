@@ -13,7 +13,6 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.TextUtils;
-import android.util.Base64;
 import android.webkit.CookieManager;
 import android.webkit.URLUtil;
 import android.webkit.WebView;
@@ -24,11 +23,15 @@ import androidx.annotation.Nullable;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Locale;
 
 /**
@@ -51,9 +54,9 @@ import java.util.Locale;
 final class DownloadHandler {
 
     /**
-     * Hard ceiling for a {@code blob:} export, measured on the blob itself inside the page.
-     * Anything larger is refused before a base64 copy (which is ~33 % bigger than the
-     * payload) is built in the renderer.
+     * Hard ceiling for a downloaded payload, enforced twice: on the blob itself inside the page
+     * (so a base64 copy ~33 % bigger is never built in the renderer) and again while copying to
+     * the destination (so a page that ignores its own ceiling cannot grow the write indefinitely).
      */
     private static final long MAX_BLOB_BYTES = 48L * 1024L * 1024L;
     private static final int BLOB_POLL_INTERVAL_MS = 250;
@@ -183,7 +186,9 @@ final class DownloadHandler {
                                         String contentDisposition) {
         try {
             if (url.length() > MAX_BLOB_BYTES / 3 * 4 + 1024) {
-                // Decoding would allocate another ~75 % of the string on top of it.
+                // The ceiling is about the *renderer*: the base64 copy the page built to get
+                // here is already ~33 % larger than the payload. On this side the payload is
+                // streamed to disk below, so no further copy of it is ever allocated.
                 Toast.makeText(activity, R.string.download_too_large, Toast.LENGTH_SHORT).show();
                 return;
             }
@@ -193,7 +198,6 @@ final class DownloadHandler {
                 return;
             }
             String header = url.substring(5, comma);
-            String payload = url.substring(comma + 1);
             boolean isBase64 = header.toLowerCase(Locale.US).contains(";base64");
             String declaredMime = header.split(";")[0];
 
@@ -201,16 +205,21 @@ final class DownloadHandler {
                     ? declaredMime
                     : (!TextUtils.isEmpty(mimeType) ? mimeType : "application/octet-stream");
 
-            byte[] bytes = isBase64
-                    ? Base64.decode(payload, Base64.DEFAULT)
-                    : Uri.decode(payload).getBytes(StandardCharsets.UTF_8);
-
             String fileName = sanitizeFileName(
                     URLUtil.guessFileName("arena-download", contentDisposition, effectiveMime));
             if (!fileName.contains(".")) {
                 fileName = fileName + "." + extensionForMime(effectiveMime);
             }
-            saveBytes(activity, bytes, effectiveMime, fileName);
+
+            if (isBase64) {
+                saveStream(activity,
+                        Base64.getMimeDecoder().wrap(new AsciiRegionStream(url, comma + 1, url.length())),
+                        -1L, effectiveMime, fileName);
+            } else {
+                saveBytes(activity,
+                        Uri.decode(url.substring(comma + 1)).getBytes(StandardCharsets.UTF_8),
+                        effectiveMime, fileName);
+            }
         } catch (Exception e) {
             Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
         }
@@ -387,25 +396,28 @@ final class DownloadHandler {
                                 return;
                             }
                             int separator = combined.lastIndexOf('\u0000');
-                            String dataUrl = separator >= 0 ? combined.substring(0, separator) : combined;
+                            int payloadEnd = separator >= 0 ? separator : combined.length();
                             String blobMime = separator >= 0 ? combined.substring(separator + 1) : "";
 
                             // Second line of defence behind the in-page b.size check: the
                             // page could have been navigated between the two evaluations, or
                             // an older shim could have skipped the size guard. base64 grows
                             // by 4/3, so this is the same ceiling in characters.
-                            if (dataUrl.length() > MAX_BLOB_BYTES / 3 * 4 + 1024) {
+                            if (payloadEnd > MAX_BLOB_BYTES / 3 * 4 + 1024) {
                                 Toast.makeText(activity, R.string.download_too_large, Toast.LENGTH_SHORT).show();
                                 return;
                             }
 
-                            int comma = dataUrl.indexOf(',');
+                            // The base64 alphabet contains no comma, so the last one inside the
+                            // data URL is its header separator. Searching backwards from
+                            // payloadEnd keeps a comma in the trailing MIME from being mistaken
+                            // for it, and avoids copying the data URL out first.
+                            int comma = payloadEnd > 0 ? combined.lastIndexOf(',', payloadEnd - 1) : -1;
                             if (comma < 0) {
                                 Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
                                 return;
                             }
-                            String header = dataUrl.substring(0, comma);
-                            String payload = dataUrl.substring(comma + 1);
+                            String header = combined.substring(0, comma);
                             boolean isBase64 = header.toLowerCase(Locale.US).contains(";base64");
 
                             String declaredMime = header.startsWith("data:")
@@ -417,16 +429,27 @@ final class DownloadHandler {
                                     ? declaredMime
                                     : (!TextUtils.isEmpty(mimeType) ? mimeType : "application/octet-stream"));
 
-                            byte[] bytes = isBase64
-                                    ? Base64.decode(payload, Base64.DEFAULT)
-                                    : Uri.decode(payload).getBytes(StandardCharsets.UTF_8);
-
                             String fileName = sanitizeFileName(
                                     URLUtil.guessFileName("arena-download", contentDisposition, effectiveMime));
                             if (!fileName.contains(".")) {
                                 fileName = fileName + "." + extensionForMime(effectiveMime);
                             }
-                            saveBytes(activity, bytes, effectiveMime, fileName);
+
+                            if (isBase64) {
+                                // Decode straight into the destination: this is the one path
+                                // where the payload string is already resident, and copying it
+                                // (or decoding it into a fresh array first) is what used to put
+                                // a permitted 48 MB export over the per-app heap limit.
+                                saveStream(activity,
+                                        Base64.getMimeDecoder().wrap(new AsciiRegionStream(
+                                                combined, comma + 1, payloadEnd)),
+                                        -1L, effectiveMime, fileName);
+                            } else {
+                                saveBytes(activity,
+                                        Uri.decode(combined.substring(comma + 1, payloadEnd))
+                                                .getBytes(StandardCharsets.UTF_8),
+                                        effectiveMime, fileName);
+                            }
                         } catch (Exception e) {
                             Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
                         } finally {
@@ -472,54 +495,137 @@ final class DownloadHandler {
             return;
         }
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
-                values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
-                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            saveStream(activity, new ByteArrayInputStream(data), data.length, mimeType, fileName);
+        } catch (Exception e) {
+            Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
+        }
+    }
 
-                Uri item = activity.getContentResolver()
-                        .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-                if (item == null) {
-                    Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
-                    return;
-                }
+    /**
+     * Streams a payload into Downloads (MediaStore on Q+, the app-private directory below it)
+     * through a fixed 64 KB buffer, so peak heap stays at the buffer size regardless of how long
+     * the payload is. {@code declaredLength} may be {@code -1} when it is not known up front.
+     *
+     * <p>If the write fails the half-created MediaStore row is deleted again: a pending row would
+     * otherwise linger in Downloads as an empty file the user never asked to keep.</p>
+     */
+    private static void saveStream(Activity activity, InputStream source, long declaredLength,
+                                   String mimeType, String fileName) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            if (declaredLength >= 0) {
+                values.put(MediaStore.MediaColumns.SIZE, declaredLength);
+            }
+
+            Uri item = activity.getContentResolver()
+                    .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (item == null) {
+                throw new IOException("MediaStore refused the download");
+            }
+            try {
                 try (OutputStream out = activity.getContentResolver().openOutputStream(item)) {
                     if (out == null) {
-                        throw new IllegalStateException("No output stream");
+                        throw new IOException("No output stream for the download");
                     }
-                    out.write(data);
+                    copyCapped(source, out);
                     out.flush();
                 }
                 values.clear();
                 values.put(MediaStore.MediaColumns.IS_PENDING, 0);
                 activity.getContentResolver().update(item, values, null, null);
-                Toast.makeText(activity, R.string.download_saved, Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            File dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-            if (dir == null) {
-                dir = activity.getFilesDir();
-            }
-            if (!dir.exists() && !dir.mkdirs()) {
-                Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
-                return;
-            }
-            File target = new File(dir, fileName);
-            try (FileOutputStream out = new FileOutputStream(target)) {
-                out.write(data);
-                out.flush();
-            }
-            try {
-                MediaScannerConnection.scanFile(activity,
-                        new String[]{target.getAbsolutePath()}, new String[]{mimeType}, null);
-            } catch (Exception ignored) {
+            } catch (IOException | RuntimeException e) {
+                try {
+                    activity.getContentResolver().delete(item, null, null);
+                } catch (Exception ignored) {
+                    // Nothing further to do; the original failure is what the user hears about.
+                }
+                throw e;
             }
             Toast.makeText(activity, R.string.download_saved, Toast.LENGTH_SHORT).show();
-        } catch (Exception e) {
-            Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        File dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) {
+            dir = activity.getFilesDir();
+        }
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IOException("Could not create the download directory");
+        }
+        File target = new File(dir, fileName);
+        try (FileOutputStream out = new FileOutputStream(target)) {
+            copyCapped(source, out);
+            out.flush();
+        }
+        try {
+            MediaScannerConnection.scanFile(activity,
+                    new String[]{target.getAbsolutePath()}, new String[]{mimeType}, null);
+        } catch (Exception ignored) {
+        }
+        Toast.makeText(activity, R.string.download_saved, Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * Copies with a reusable buffer and refuses to grow past {@link #MAX_BLOB_BYTES}, which is the
+     * only thing standing between a page that ignores its own ceiling and an out-of-memory kill.
+     */
+    private static void copyCapped(InputStream source, OutputStream target) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+        int read;
+        while ((read = source.read(buffer)) != -1) {
+            total += read;
+            if (total > MAX_BLOB_BYTES) {
+                throw new IOException("Payload exceeded the download ceiling");
+            }
+            target.write(buffer, 0, read);
+        }
+    }
+
+    /**
+     * Reads one region of a {@link String} as ASCII bytes without copying it. Base64 payloads are
+     * ASCII by definition; anything else in the region decodes to garbage and is rejected by the
+     * decoder, which is exactly how the previous substring-based code behaved too.
+     */
+    private static final class AsciiRegionStream extends InputStream {
+        private final String source;
+        private final int end;
+        private int position;
+
+        AsciiRegionStream(String source, int start, int end) {
+            this.source = source;
+            this.position = Math.max(start, 0);
+            this.end = Math.min(end, source.length());
+        }
+
+        @Override
+        public int read() {
+            return position < end ? source.charAt(position++) & 0xFF : -1;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) {
+            if (length <= 0) {
+                return 0;
+            }
+            if (position >= end) {
+                return -1;
+            }
+            int count = Math.min(length, end - position);
+            for (int i = 0; i < count; i++) {
+                buffer[offset + i] = (byte) source.charAt(position + i);
+            }
+            position += count;
+            return count;
+        }
+
+        @Override
+        public int available() {
+            return end - position;
         }
     }
 

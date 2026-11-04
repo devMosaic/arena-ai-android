@@ -12,7 +12,7 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
  * Number of logTest() results the suite is expected to produce. Kept next to the count so
  * that adding a check without updating the documents that quote it fails the build.
  */
-const EXPECTED_CHECK_COUNT = 123;
+const EXPECTED_CHECK_COUNT = 127;
 
 // ---------------------------------------------------------------------------------------
 // APK readers. These parse the *artifact* rather than the source text, so a claim about the
@@ -375,6 +375,61 @@ async function runAllTests() {
   logTest('Android Build', 'ProGuard / R8 Rules Present',
     fs.existsSync(proguardPath) && fs.readFileSync(proguardPath, 'utf8').includes('ai.arena.mobile'));
 
+  // aapt resolves resource names at build time. There is no JVM in this environment, so the
+  // resolution is re-implemented here: every R.<type>.<name> in the Java sources and every
+  // @<type>/<name> in the manifest has to point at something that actually exists under res/.
+  // This is the check that catches a renamed or forgotten drawable, which otherwise only fails
+  // on the first real build.
+  logTest('Android Build', 'every resource reference in Java and the manifest resolves', (() => {
+    const listing = (dir) => {
+      try {
+        return fs.readdirSync(dir);
+      } catch (err) {
+        return [];
+      }
+    };
+    const pool = (type) => {
+      const names = new Set();
+      for (const dir of listing(resDir).filter((d) => d === type || d.startsWith(`${type}-`))) {
+        for (const file of listing(path.join(resDir, dir))) {
+          names.add(file.replace(/(\.9)?\.(xml|png|webp|jpg|jpeg|gif)$/, ''));
+        }
+      }
+      for (const values of listing(path.join(resDir, 'values')).filter((f) => f.endsWith('.xml'))) {
+        const text = fs.readFileSync(path.join(resDir, 'values', values), 'utf8');
+        for (const m of text.matchAll(/<(?:string|color|dimen|integer|bool|string-array|style)\s+name="([^"]+)"/g)) {
+          names.add(m[1]);
+        }
+      }
+      return names;
+    };
+    const kinds = ['string', 'drawable', 'mipmap', 'xml', 'layout', 'color', 'style', 'dimen'];
+    const pools = {};
+    for (const kind of kinds) {
+      pools[kind] = pool(kind);
+    }
+    const javaSrc = ['MainActivity', 'DownloadHandler', 'AppUpdateManager', 'UpdateVerifier']
+      .map((name) => path.join(srcDir, 'java', 'ai', 'arena', 'mobile', `${name}.java`))
+      .filter((p) => fs.existsSync(p))
+      .map((p) => fs.readFileSync(p, 'utf8'))
+      .join('\n');
+    const manifestSrc = fs.readFileSync(manifestPath, 'utf8');
+
+    for (const m of javaSrc.matchAll(/(?<!android\.)\bR\.(string|drawable|mipmap|xml|layout|color|style|dimen)\.([A-Za-z_]\w*)/g)) {
+      if (!pools[m[1]] || !pools[m[1]].has(m[2])) {
+        return false;
+      }
+    }
+    for (const m of manifestSrc.matchAll(/"@\+?(string|drawable|mipmap|xml|layout|color|style|dimen)\/([A-Za-z_]\w*)"/g)) {
+      if (!pools[m[1]] || !pools[m[1]].has(m[2])) {
+        return false;
+      }
+    }
+    // A declared-but-unreferenced string is harmless; an unreferenced *file* under drawable/
+    // would be dead weight, so flag only the reverse direction that actually breaks a build.
+    return pools.string.size > 0 && pools.drawable.size > 0 && pools.mipmap.size > 0;
+  })());
+
   // --- Suite 3: Adaptive Icons & Branding ---
   console.log('\n▶ SUITE 3: Official Brand Icons & Adaptive Drawables');
   const bgVector = path.join(resDir, 'drawable', 'ic_launcher_background.xml');
@@ -521,6 +576,20 @@ async function runAllTests() {
 
   logTest('Downloads', 'a data: download is size-capped before it is decoded',
     /if \(url\.length\(\) > MAX_BLOB_BYTES/.test(downloadSrc));
+
+  // Base64 of a permitted 48 MB export is a ~64 MB String already resident on the Java side.
+  // Copying it (substring) and then decoding it into a fresh array put peak heap near 240 MB,
+  // which is over the default per-app limit on many devices — an OOM at a size the ceiling
+  // explicitly allows. Both now stream through one reusable buffer.
+  logTest('Downloads', 'base64 payloads are streamed to disk, not copied and re-decoded',
+    downloadSrc.includes('Base64.getMimeDecoder().wrap(new AsciiRegionStream')
+    && !downloadSrc.includes('Base64.decode(')
+    && !downloadSrc.includes('String payload =')
+    && (downloadSrc.match(/copyCapped\(/g) || []).length >= 3);
+
+  logTest('Downloads', 'a failed MediaStore write does not leave a pending row behind',
+    downloadSrc.includes('getContentResolver().delete(item, null, null)')
+    && downloadSrc.includes('throw new IOException("MediaStore refused the download")'));
 
   logTest('Web Bridge', 'Camera capture offered when the page requests capture',
     mainActivitySrc.includes('isCaptureEnabled')
@@ -677,6 +746,15 @@ async function runAllTests() {
         && mainActivitySrc.includes('popupWindows.clear()')
         && /onDestroy\(\)[\s\S]*webView = null;/.test(mainActivitySrc);
     })());
+
+  // Retention is only half of "uses too much memory": a single oversized allocation can trip the
+  // per-app heap limit on its own, so the one unbounded write path keeps its copy bounded by a
+  // fixed buffer and re-checks the ceiling while it copies.
+  logTest('Memory', 'download writes peak at a buffer, not at the payload size',
+    /copyCapped\(InputStream source, OutputStream target\)/.test(downloadSrc)
+    && downloadSrc.includes('byte[] buffer = new byte[64 * 1024];')
+    && downloadSrc.includes('Payload exceeded the download ceiling')
+    && !/out\.write\(data\);/.test(downloadSrc));
 
   logTest('Updater', 'documented check interval matches the code',
     (() => {

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the full local verification: the 123-check audit suite plus the Gradle unit tests
+# Run the full local verification: the 127-check audit suite plus the Gradle unit tests
 # when an Android SDK/JDK is available (CI does this on every push).
 set -euo pipefail
 

@@ -76,7 +76,7 @@ In **v1.0.2**, the application resolves the scroll-up accidental reload issue by
 
 ## 5. Automated Verification Results
 
-- **Test Suite Status:** 123 / 123 Passing (100% Success Rate)
+- **Test Suite Status:** 127 / 127 Passing (100% Success Rate)
 - **Suite Breakdown:**
   - Suite 1: Local Development Server & Diagnostics (2/2 passing)
   - Suite 2: Android Architecture & Security Hardening (13/13 passing)
@@ -150,17 +150,31 @@ current.
 | File chooser | Camera cleanup read back fields it had just nulled, so every capture stayed on disk forever → deletes from the captured locals, plus `pruneStaleCameraCaptures()` at launch and removal of the dead `pendingCameraMime` |
 | Intents | `Intent.parseUri` + `startActivity` from page text was an intent-redirection primitive (categories are not matched for explicit intents) → `component`/`selector`/`package` stripped, `browser_fallback_url` restricted to http(s); popups can no longer open popups; the installer now gets an explicit archive MIME + read grant rather than `ACTION_VIEW` MIME guessing |
 | Memory | Four retention chains removed: the static progress `AlertDialog` (pinned the whole destroyed `ContextThemeWrapper` graph), the update worker and its progress posts (up to 23 s of socket timeouts holding a dead Activity), the 120-tick blob poll (which also called `evaluateJavascript` on a destroyed WebView), and the reconnect `HEAD` probe (~5 s past `onDestroy`, connection never disconnected) |
+| Peak heap | Retention was only half of it: a download's base64 payload was copied out of the incoming `String` with `substring()` and then decoded into a fresh `byte[]`, so an export at the permitted 48 MB ceiling peaked near **240 MB live** — past the default per-app heap limit on many devices, i.e. an out-of-memory kill at a size the ceiling explicitly allows. The payload now decodes from the original string region straight into the destination through one reusable 64 KB buffer (`AsciiRegionStream` + `Base64.getMimeDecoder().wrap`), which re-checks the ceiling while copying; a failed MediaStore write also deletes its pending row instead of leaving a zero-length download |
 | Platform | Pull-to-refresh falls back to the native root-scroll check off-Arena (it was structurally impossible on `accounts.google.com`, `github.com/login/oauth`, `lmsys.org`, …) and uses the captured snapshot; `https://*.lmsys.org` is now a bridge origin and the two host lists are asserted equal; `onConfigurationChanged` applies system font scale; cached insets re-applied on exiting fullscreen; deprecated `onReceivedError` overload removed; the MainActivity typo fixed |
 | Tooling | Dev proxy: WebSocket upgrades attached explicitly (`server.on('upgrade')`), error handling no longer assumes an HTTP response, loopback `Host` pinning with `ALLOWED_HOSTS`, LAN bind warning; `docker-compose.yml` publishes on `127.0.0.1` only; `requirements.txt` pins `Pillow==11.3.0`; `npm audit fix` → 0 vulnerabilities; `NOTICE` no longer credits Material Components and is re-staged as `assets/NOTICE.txt` |
-| Tests | **92 → 123 checks.** Suite 10 now reads the APK itself (zip central directory, v1 digest recomputation, PKCS#7 cert DER walk vs. the README fingerprint and the CI pin, binary-manifest `versionName`, signing-block scheme IDs), fails on undisclosed committed-binary drift, asserts the new behavioural invariants, and `EXPECTED_CHECK_COUNT` is gated in `tests/runner.js` so every quoted count has to move with the suite |
+| Tests | **92 → 127 checks.** Suite 10 now reads the APK itself (zip central directory, v1 digest recomputation, PKCS#7 cert DER walk vs. the README fingerprint and the CI pin, binary-manifest `versionName`, signing-block scheme IDs), fails on undisclosed committed-binary drift, asserts the new behavioural invariants, and `EXPECTED_CHECK_COUNT` is gated in `tests/runner.js` so every quoted count has to move with the suite |
 
 ### 7.3 Release state
 
 - **Not release-ready as v1.0.4** until a `v1.0.4` tag + release exists; publishing is what makes
   any of the above reachable by users of 1.0.3.
-- No `javac`/`gradle`/`aapt`/`apksigner` in the audit environment: Java changes are parsed
-  (tree-sitter) and reviewed, not compiled. **Run `./gradlew assembleRelease` on a real toolchain
+- **No build is possible in this sandbox, by network policy rather than missing packages.**
+  `java`, `javac`, `gradle`, `aapt` and `apksigner` are all absent, `apt-get` cannot even locate
+  `openjdk-17-jdk-headless`, and the only reachable hosts are `github.com`, `codeload.github.com`,
+  `api.github.com`, `registry.npmjs.org`, `pypi.org` and `files.pythonhosted.org` — so
+  `dl.google.com` (Android SDK, AGP, AndroidX) and `services.gradle.org` (the wrapper distribution,
+  `gradle-8.14.6-bin.zip`) are unreachable. Installing a JDK would not be enough; the dependency
+  graph cannot be fetched at all. **`./gradlew test assembleRelease` on a real toolchain is required
   before tagging.**
+- What was done instead, so "unverified" does not mean "unchecked": the four sources were parsed
+  with a Java grammar (0 error nodes); a symbol sweep over every bare call, `this.` field access and
+  undeclared identifier returned only inherited framework members (no typos, and no lingering
+  reference to the removed `pendingCameraMime`); every `R.<type>.<name>` in Java and every
+  `@<type>/<name>` in the manifest was confirmed to exist under `res/` — now a permanent audit-suite
+  check, since `aapt` is exactly what would catch that class of error; and all manifest/XML files
+  parse as well-formed XML. Signature and arity of every changed method were re-read at each call
+  site by hand.
 - No emulator or device: nothing here is on-device verified, which matters most for the OEM
   `SigningInfo` quirk and the camera-capture cleanup.
 - `reproducible-artifacts` remains `false`; the icon generator produces the right structure but is

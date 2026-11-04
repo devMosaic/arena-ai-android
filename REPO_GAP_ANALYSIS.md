@@ -37,7 +37,7 @@ Legend: **Done** · **Partial** · **Not done** (reason given).
 | Check | Result |
 | :--- | :--- |
 | Java compile | All 4 main sources **and** both unit-test sources compile with **0 errors** (ECJ 3.12.1, `-1.8`) against the real `android-34.jar` platform API plus stubs written to the published signatures for every AndroidX type used (`appcompat`, `activity`, `webkit`, `swiperefreshlayout`, `core`, `annotation`, `lifecycle`). No JDK/Android SDK exists in this sandbox, so this was the only compile check available locally. GitHub Actions run `39127380211` then built the branch for real: `test`, `lintDebug`, `assembleRelease`, `assembleDebug` and `scripts/verify-apk.sh` all succeeded. |
-| `npm test` | **123 / 123 passed** |
+| `npm test` | **127 / 127 passed** |
 | Syntax | `node --check` on `server.js` and every file in `tests/`; `py_compile` on `process_official_icon.py`; YAML parse of both workflows and `dependabot.yml` |
 | Icon generator | Re-run end-to-end into a temp directory: 10 PNGs, correct density ladder (48→192 px), RGBA |
 | Refresh gesture | The page-side gating shim was executed in a Node DOM harness: a scrolled nested container blocks the pull, returning to its top re-arms it, a scrolled root blocks it, and a scrolled off-screen container does not |
@@ -991,3 +991,15 @@ hardening claims in `1.0.4` were untestable from outside.
    Pillow is now pinned to reduce even that.
 4. **No on-device verification.** No emulator, no instrumentation tests, no OEM matrix — N6 in
    particular is exactly the class of bug that only shows up on specific vendor ROMs.
+5. **No compiler.** `java`/`javac`/`gradle`/`aapt` are absent and `dl.google.com`,
+   `services.gradle.org` and the apt mirrors are outside this sandbox's network allow-list, so
+   nothing here can be compiled — only parsed (tree-sitter), resource-resolved and grepped. The
+   build has to happen on a real toolchain before merge.
+
+### Retained as-is after review
+
+`Intent.parseUri` sanitising, popup teardown, offline/reconnect handling and the safe-browsing and
+cleartext settings were re-read this pass and found correct. Two further items were measured rather
+than assumed: a symbol-resolution sweep over the four sources (every bare call, `this.` field and
+undeclared identifier) returned only inherited Android/Java framework members, and the new resource
+check confirms all 48 strings, 3 drawables, both `xml/` roots and every manifest reference resolve.

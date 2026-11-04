@@ -13,19 +13,25 @@ import android.os.Handler;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.text.TextUtils;
-import android.util.Base64;
 import android.webkit.CookieManager;
 import android.webkit.URLUtil;
 import android.webkit.WebView;
 import android.widget.Toast;
 
+import androidx.annotation.Nullable;
+
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Locale;
 
 /**
@@ -47,12 +53,40 @@ import java.util.Locale;
  */
 final class DownloadHandler {
 
-    private static final int MAX_BLOB_DATA_URL_LENGTH = 64 * 1024 * 1024; // ~48 MB binary
+    /**
+     * Hard ceiling for a downloaded payload, enforced twice: on the blob itself inside the page
+     * (so a base64 copy ~33 % bigger is never built in the renderer) and again while copying to
+     * the destination (so a page that ignores its own ceiling cannot grow the write indefinitely).
+     */
+    private static final long MAX_BLOB_BYTES = 48L * 1024L * 1024L;
     private static final int BLOB_POLL_INTERVAL_MS = 250;
     private static final int BLOB_POLL_ATTEMPTS = 120; // 30 seconds
 
     private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
-    private static volatile boolean blobDownloadInProgress = false;
+
+    /**
+     * Owner of the single in-page blob handshake. Keyed by WebView rather than a plain
+     * boolean, and paired with a deadline, so a poll whose callback never arrives (the page
+     * or WebView was destroyed underneath it) cannot block every later download until the
+     * process restarts.
+     *
+     * <p>Held weakly on purpose: a WebView pins its activity, so a strong static here would
+     * trade one leak for a worse one. Identity is compared through the referent, and a cleared
+     * reference is treated as "unowned" so the lock can always be taken over.
+     */
+    @Nullable
+    private static volatile WeakReference<WebView> blobLockOwner = null;
+    private static volatile long blobLockDeadline = 0L;
+
+    /**
+     * The one pending retry of the poll loop. Held so it can be removed from the main handler
+     * when its WebView goes away: each {@code postDelayed} lambda captures the activity and the
+     * source WebView, so an unremoved chain kept a destroyed Activity (and a WebView whose
+     * renderer was gone) alive for the remaining 30 seconds — and kept calling
+     * {@code evaluateJavascript} on it.
+     */
+    @Nullable
+    private static volatile Runnable pendingBlobPoll = null;
 
     private DownloadHandler() {
     }
@@ -151,13 +185,19 @@ final class DownloadHandler {
     private static void downloadDataUri(Activity activity, String url, String mimeType,
                                         String contentDisposition) {
         try {
+            if (url.length() > MAX_BLOB_BYTES / 3 * 4 + 1024) {
+                // The ceiling is about the *renderer*: the base64 copy the page built to get
+                // here is already ~33 % larger than the payload. On this side the payload is
+                // streamed to disk below, so no further copy of it is ever allocated.
+                Toast.makeText(activity, R.string.download_too_large, Toast.LENGTH_SHORT).show();
+                return;
+            }
             int comma = url.indexOf(',');
             if (comma < 0) {
                 Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
                 return;
             }
             String header = url.substring(5, comma);
-            String payload = url.substring(comma + 1);
             boolean isBase64 = header.toLowerCase(Locale.US).contains(";base64");
             String declaredMime = header.split(";")[0];
 
@@ -165,16 +205,21 @@ final class DownloadHandler {
                     ? declaredMime
                     : (!TextUtils.isEmpty(mimeType) ? mimeType : "application/octet-stream");
 
-            byte[] bytes = isBase64
-                    ? Base64.decode(payload, Base64.DEFAULT)
-                    : Uri.decode(payload).getBytes(StandardCharsets.UTF_8);
-
             String fileName = sanitizeFileName(
                     URLUtil.guessFileName("arena-download", contentDisposition, effectiveMime));
             if (!fileName.contains(".")) {
                 fileName = fileName + "." + extensionForMime(effectiveMime);
             }
-            saveBytes(activity, bytes, effectiveMime, fileName);
+
+            if (isBase64) {
+                saveStream(activity,
+                        Base64.getMimeDecoder().wrap(new AsciiRegionStream(url, comma + 1, url.length())),
+                        -1L, effectiveMime, fileName);
+            } else {
+                saveBytes(activity,
+                        Uri.decode(url.substring(comma + 1)).getBytes(StandardCharsets.UTF_8),
+                        effectiveMime, fileName);
+            }
         } catch (Exception e) {
             Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
         }
@@ -185,21 +230,30 @@ final class DownloadHandler {
     // ---------------------------------------------------------------------------------
 
     private static void downloadBlob(Activity activity, WebView source, String blobUrl,
-                                     String mimeType, String contentDisposition) {
+                                      String mimeType, String contentDisposition) {
         if (source == null) {
             return;
         }
-        if (blobDownloadInProgress) {
+        // The in-page handshake uses one set of global variables, so only one export can be
+        // in flight per page. The lock is owned by the WebView and carries a deadline, so a
+        // destroyed source or a callback that never fires can no longer wedge every later
+        // download for the rest of the process (see tryAcquireBlobLock).
+        if (!tryAcquireBlobLock(source)) {
             Toast.makeText(activity, R.string.download_in_progress, Toast.LENGTH_SHORT).show();
             return;
         }
-        blobDownloadInProgress = true;
 
-        String safeUrl = blobUrl.replace("\\", "\\\\").replace("'", "\\'");
+        // The byte cap is enforced inside the page, before FileReader materialises the
+        // base64 form: checking only on the Java side would run after the whole payload has
+        // already been built in the renderer and copied across JNI as a String, which is
+        // precisely the OOM the limit is meant to prevent.
+        String safeUrl = toJavaScriptStringLiteral(blobUrl);
         String script =
                 "window.__arenaBlobState='PENDING';window.__arenaBlobData=null;window.__arenaBlobMime='';"
                         + "(function(){try{"
-                        + "fetch('" + safeUrl + "').then(function(r){return r.blob();}).then(function(b){"
+                        + "fetch(" + safeUrl + ").then(function(r){return r.blob();}).then(function(b){"
+                        + "if(!b){window.__arenaBlobState='ERROR';return;}"
+                        + "if(b.size>" + MAX_BLOB_BYTES + "){window.__arenaBlobState='TOO_LARGE';return;}"
                         + "var fr=new FileReader();"
                         + "fr.onload=function(){window.__arenaBlobState='OK';window.__arenaBlobData=fr.result;"
                         + "window.__arenaBlobMime=b.type||'';};"
@@ -211,7 +265,7 @@ final class DownloadHandler {
         try {
             source.evaluateJavascript(script, null);
         } catch (Exception e) {
-            blobDownloadInProgress = false;
+            releaseBlobLock(source);
             Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
             return;
         }
@@ -219,11 +273,87 @@ final class DownloadHandler {
         pollBlob(activity, source, mimeType, contentDisposition, 0);
     }
 
+    /**
+     * Encodes a value as a double-quoted JavaScript string literal, escaping every character
+     * that could terminate the literal or the surrounding statement. Hand-rolling
+     * {@code \} and {@code '} only was fragile: a raw newline in the URL produced a script
+     * that failed to compile, silently cancelling the export.
+     */
+    private static String toJavaScriptStringLiteral(String value) {
+        StringBuilder out = new StringBuilder(value.length() + 8);
+        out.append('"');
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c == '"' || c == '\\' || c < 0x20 || c == 0x2028 || c == 0x2029 || c > 0x7e) {
+                out.append("\\u").append(String.format(Locale.US, "%04x", (int) c));
+            } else {
+                out.append(c);
+            }
+        }
+        out.append('"');
+        return out.toString();
+    }
+
+    /**
+     * Claims the single in-page blob handshake for {@code owner}. A stale claim (its deadline
+     * passed, or its WebView was destroyed) is taken over instead of blocking forever.
+     */
+    private static synchronized boolean tryAcquireBlobLock(WebView owner) {
+        long now = System.currentTimeMillis();
+        // Only a provably dead claim may be taken over: either its WebView is gone (weak
+        // referent cleared) or the deadline elapsed. A live owner always gets the "already in
+        // progress" answer, because the in-page handshake has a single set of globals and a
+        // second concurrent export would overwrite them and mix the two files up.
+        WebView current = blobLockOwner == null ? null : blobLockOwner.get();
+        if (current != null && now < blobLockDeadline) {
+            return false;
+        }
+        blobLockOwner = new WeakReference<>(owner);
+        blobLockDeadline = now + (long) BLOB_POLL_ATTEMPTS * BLOB_POLL_INTERVAL_MS + 5000L;
+        return true;
+    }
+
+    /** Releases the claim, but never one belonging to a different (still living) WebView. */
+    private static synchronized void releaseBlobLock(@Nullable WebView owner) {
+        WebView current = blobLockOwner == null ? null : blobLockOwner.get();
+        if (owner == null || blobLockOwner == null || current == owner) {
+            blobLockOwner = null;
+            blobLockDeadline = 0L;
+            cancelPendingBlobPoll();
+        }
+    }
+
+    /**
+     * Drops the queued retry. Each poll lambda captures the activity and the source WebView,
+     * so a chain left in the main handler kept a destroyed Activity — and a WebView whose
+     * renderer was already gone — reachable for up to 30 seconds, calling
+     * {@code evaluateJavascript} on it while it did.
+     */
+    private static synchronized void cancelPendingBlobPoll() {
+        Runnable pending = pendingBlobPoll;
+        pendingBlobPoll = null;
+        if (pending != null) {
+            MAIN_HANDLER.removeCallbacks(pending);
+        }
+    }
+
+    /**
+     * Called when a WebView is destroyed (activity teardown or renderer-crash recovery) so an
+     * interrupted poll can neither leave every later download reporting "already in progress"
+     * nor retain the screen that owns it.
+     */
+    public static void onWebViewDestroyed(WebView view) {
+        releaseBlobLock(view);
+    }
+
     private static void pollBlob(Activity activity, WebView source, String mimeType,
                                  String contentDisposition, int attempt) {
-        if (attempt >= BLOB_POLL_ATTEMPTS || activity.isFinishing()) {
-            blobDownloadInProgress = false;
-            Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
+        pendingBlobPoll = null;
+        if (attempt >= BLOB_POLL_ATTEMPTS || activity.isFinishing() || activity.isDestroyed()) {
+            releaseBlobLock(source);
+            if (!activity.isFinishing() && !activity.isDestroyed()) {
+                Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
+            }
             return;
         }
 
@@ -232,17 +362,22 @@ final class DownloadHandler {
                 String state = asString(value);
                 if ("OK".equals(state)) {
                     readBlobPayload(activity, source, mimeType, contentDisposition);
+                } else if ("TOO_LARGE".equals(state)) {
+                    releaseBlobLock(source);
+                    Toast.makeText(activity, R.string.download_too_large, Toast.LENGTH_SHORT).show();
                 } else if ("ERROR".equals(state)) {
-                    blobDownloadInProgress = false;
+                    releaseBlobLock(source);
                     Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
                 } else {
-                    MAIN_HANDLER.postDelayed(
-                            () -> pollBlob(activity, source, mimeType, contentDisposition, attempt + 1),
-                            BLOB_POLL_INTERVAL_MS);
+                    // Named and remembered, so onWebViewDestroyed() can remove it.
+                    Runnable next = () ->
+                            pollBlob(activity, source, mimeType, contentDisposition, attempt + 1);
+                    pendingBlobPoll = next;
+                    MAIN_HANDLER.postDelayed(next, BLOB_POLL_INTERVAL_MS);
                 }
             });
         } catch (Exception e) {
-            blobDownloadInProgress = false;
+            releaseBlobLock(source);
             Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
         }
     }
@@ -253,7 +388,7 @@ final class DownloadHandler {
             source.evaluateJavascript(
                     "window.__arenaBlobData+'\\u0000'+window.__arenaBlobMime",
                     value -> {
-                        blobDownloadInProgress = false;
+                        releaseBlobLock(source);
                         try {
                             String combined = asString(value);
                             if (combined == null || combined.isEmpty()) {
@@ -261,21 +396,28 @@ final class DownloadHandler {
                                 return;
                             }
                             int separator = combined.lastIndexOf('\u0000');
-                            String dataUrl = separator >= 0 ? combined.substring(0, separator) : combined;
+                            int payloadEnd = separator >= 0 ? separator : combined.length();
                             String blobMime = separator >= 0 ? combined.substring(separator + 1) : "";
 
-                            if (dataUrl.length() > MAX_BLOB_DATA_URL_LENGTH) {
+                            // Second line of defence behind the in-page b.size check: the
+                            // page could have been navigated between the two evaluations, or
+                            // an older shim could have skipped the size guard. base64 grows
+                            // by 4/3, so this is the same ceiling in characters.
+                            if (payloadEnd > MAX_BLOB_BYTES / 3 * 4 + 1024) {
                                 Toast.makeText(activity, R.string.download_too_large, Toast.LENGTH_SHORT).show();
                                 return;
                             }
 
-                            int comma = dataUrl.indexOf(',');
+                            // The base64 alphabet contains no comma, so the last one inside the
+                            // data URL is its header separator. Searching backwards from
+                            // payloadEnd keeps a comma in the trailing MIME from being mistaken
+                            // for it, and avoids copying the data URL out first.
+                            int comma = payloadEnd > 0 ? combined.lastIndexOf(',', payloadEnd - 1) : -1;
                             if (comma < 0) {
                                 Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
                                 return;
                             }
-                            String header = dataUrl.substring(0, comma);
-                            String payload = dataUrl.substring(comma + 1);
+                            String header = combined.substring(0, comma);
                             boolean isBase64 = header.toLowerCase(Locale.US).contains(";base64");
 
                             String declaredMime = header.startsWith("data:")
@@ -287,16 +429,27 @@ final class DownloadHandler {
                                     ? declaredMime
                                     : (!TextUtils.isEmpty(mimeType) ? mimeType : "application/octet-stream"));
 
-                            byte[] bytes = isBase64
-                                    ? Base64.decode(payload, Base64.DEFAULT)
-                                    : Uri.decode(payload).getBytes(StandardCharsets.UTF_8);
-
                             String fileName = sanitizeFileName(
                                     URLUtil.guessFileName("arena-download", contentDisposition, effectiveMime));
                             if (!fileName.contains(".")) {
                                 fileName = fileName + "." + extensionForMime(effectiveMime);
                             }
-                            saveBytes(activity, bytes, effectiveMime, fileName);
+
+                            if (isBase64) {
+                                // Decode straight into the destination: this is the one path
+                                // where the payload string is already resident, and copying it
+                                // (or decoding it into a fresh array first) is what used to put
+                                // a permitted 48 MB export over the per-app heap limit.
+                                saveStream(activity,
+                                        Base64.getMimeDecoder().wrap(new AsciiRegionStream(
+                                                combined, comma + 1, payloadEnd)),
+                                        -1L, effectiveMime, fileName);
+                            } else {
+                                saveBytes(activity,
+                                        Uri.decode(combined.substring(comma + 1, payloadEnd))
+                                                .getBytes(StandardCharsets.UTF_8),
+                                        effectiveMime, fileName);
+                            }
                         } catch (Exception e) {
                             Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
                         } finally {
@@ -309,7 +462,7 @@ final class DownloadHandler {
                         }
                     });
         } catch (Exception e) {
-            blobDownloadInProgress = false;
+            releaseBlobLock(source);
             Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
         }
     }
@@ -342,54 +495,137 @@ final class DownloadHandler {
             return;
         }
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                ContentValues values = new ContentValues();
-                values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
-                values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
-                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            saveStream(activity, new ByteArrayInputStream(data), data.length, mimeType, fileName);
+        } catch (Exception e) {
+            Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
+        }
+    }
 
-                Uri item = activity.getContentResolver()
-                        .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-                if (item == null) {
-                    Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
-                    return;
-                }
+    /**
+     * Streams a payload into Downloads (MediaStore on Q+, the app-private directory below it)
+     * through a fixed 64 KB buffer, so peak heap stays at the buffer size regardless of how long
+     * the payload is. {@code declaredLength} may be {@code -1} when it is not known up front.
+     *
+     * <p>If the write fails the half-created MediaStore row is deleted again: a pending row would
+     * otherwise linger in Downloads as an empty file the user never asked to keep.</p>
+     */
+    private static void saveStream(Activity activity, InputStream source, long declaredLength,
+                                   String mimeType, String fileName) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, mimeType);
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            if (declaredLength >= 0) {
+                values.put(MediaStore.MediaColumns.SIZE, declaredLength);
+            }
+
+            Uri item = activity.getContentResolver()
+                    .insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (item == null) {
+                throw new IOException("MediaStore refused the download");
+            }
+            try {
                 try (OutputStream out = activity.getContentResolver().openOutputStream(item)) {
                     if (out == null) {
-                        throw new IllegalStateException("No output stream");
+                        throw new IOException("No output stream for the download");
                     }
-                    out.write(data);
+                    copyCapped(source, out);
                     out.flush();
                 }
                 values.clear();
                 values.put(MediaStore.MediaColumns.IS_PENDING, 0);
                 activity.getContentResolver().update(item, values, null, null);
-                Toast.makeText(activity, R.string.download_saved, Toast.LENGTH_SHORT).show();
-                return;
-            }
-
-            File dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-            if (dir == null) {
-                dir = activity.getFilesDir();
-            }
-            if (!dir.exists() && !dir.mkdirs()) {
-                Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
-                return;
-            }
-            File target = new File(dir, fileName);
-            try (FileOutputStream out = new FileOutputStream(target)) {
-                out.write(data);
-                out.flush();
-            }
-            try {
-                MediaScannerConnection.scanFile(activity,
-                        new String[]{target.getAbsolutePath()}, new String[]{mimeType}, null);
-            } catch (Exception ignored) {
+            } catch (IOException | RuntimeException e) {
+                try {
+                    activity.getContentResolver().delete(item, null, null);
+                } catch (Exception ignored) {
+                    // Nothing further to do; the original failure is what the user hears about.
+                }
+                throw e;
             }
             Toast.makeText(activity, R.string.download_saved, Toast.LENGTH_SHORT).show();
-        } catch (Exception e) {
-            Toast.makeText(activity, R.string.download_failed, Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        File dir = activity.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+        if (dir == null) {
+            dir = activity.getFilesDir();
+        }
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IOException("Could not create the download directory");
+        }
+        File target = new File(dir, fileName);
+        try (FileOutputStream out = new FileOutputStream(target)) {
+            copyCapped(source, out);
+            out.flush();
+        }
+        try {
+            MediaScannerConnection.scanFile(activity,
+                    new String[]{target.getAbsolutePath()}, new String[]{mimeType}, null);
+        } catch (Exception ignored) {
+        }
+        Toast.makeText(activity, R.string.download_saved, Toast.LENGTH_SHORT).show();
+    }
+
+    /**
+     * Copies with a reusable buffer and refuses to grow past {@link #MAX_BLOB_BYTES}, which is the
+     * only thing standing between a page that ignores its own ceiling and an out-of-memory kill.
+     */
+    private static void copyCapped(InputStream source, OutputStream target) throws IOException {
+        byte[] buffer = new byte[64 * 1024];
+        long total = 0;
+        int read;
+        while ((read = source.read(buffer)) != -1) {
+            total += read;
+            if (total > MAX_BLOB_BYTES) {
+                throw new IOException("Payload exceeded the download ceiling");
+            }
+            target.write(buffer, 0, read);
+        }
+    }
+
+    /**
+     * Reads one region of a {@link String} as ASCII bytes without copying it. Base64 payloads are
+     * ASCII by definition; anything else in the region decodes to garbage and is rejected by the
+     * decoder, which is exactly how the previous substring-based code behaved too.
+     */
+    private static final class AsciiRegionStream extends InputStream {
+        private final String source;
+        private final int end;
+        private int position;
+
+        AsciiRegionStream(String source, int start, int end) {
+            this.source = source;
+            this.position = Math.max(start, 0);
+            this.end = Math.min(end, source.length());
+        }
+
+        @Override
+        public int read() {
+            return position < end ? source.charAt(position++) & 0xFF : -1;
+        }
+
+        @Override
+        public int read(byte[] buffer, int offset, int length) {
+            if (length <= 0) {
+                return 0;
+            }
+            if (position >= end) {
+                return -1;
+            }
+            int count = Math.min(length, end - position);
+            for (int i = 0; i < count; i++) {
+                buffer[offset + i] = (byte) source.charAt(position + i);
+            }
+            position += count;
+            return count;
+        }
+
+        @Override
+        public int available() {
+            return end - position;
         }
     }
 

@@ -9,6 +9,125 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — download pipeline
+
+- **A destroyed page can no longer wedge every later `blob:` export.** The in-page handshake
+  guard became an owned, expiring claim (`WeakReference<WebView>` + deadline) instead of a bare
+  `static boolean`, and `DownloadHandler.onWebViewDestroyed()` releases it from
+  `onDestroy()` and from renderer-crash recovery. Previously a poll whose callback never arrived
+  left the flag set for the life of the process ("A download is already in progress" forever).
+- **The 48 MB export ceiling is now enforced inside the page**, on `blob.size` before
+  `readAsDataURL()`, instead of on the Java side after the base64 copy had already been built in
+  the renderer and copied across JNI as a `String` — i.e. after the memory spike it existed to
+  prevent. `data:` downloads are capped before decoding too.
+- **Blob URLs are injected as a properly escaped JavaScript string literal**
+  (`toJavaScriptStringLiteral`), replacing hand-rolled `'`/`\` escaping that could produce a
+  script which fails to compile and silently cancels the export.
+- **A permitted download no longer needs several times its own size in heap.** The base64 payload
+  used to be copied out of the incoming `String` with `substring()` and then decoded into a fresh
+  `byte[]`, so a 48 MB export peaked at roughly 240 MB of live allocation — past the default
+  per-app limit on many devices, i.e. an out-of-memory kill at a size the ceiling explicitly
+  allows. The payload is now decoded straight from the region of the original string
+  (`AsciiRegionStream` + `Base64.getMimeDecoder().wrap`) into the destination through one reusable
+  64 KB buffer, which also enforces the ceiling while copying.
+- **A failed MediaStore write no longer leaves a pending row behind.** If opening the stream or
+  copying throws, the half-created `Downloads` entry is deleted instead of staying as a
+  zero-length file the user never asked to keep.
+
+### Fixed — self-updater
+
+- **Deferred installs survive the process being killed.** A verified APK waiting for the
+  *install unknown apps* grant is recorded in `SharedPreferences` (path, expected SHA-256, tag)
+  and re-verified through `UpdateVerifier` before the installer reopens, so the round trip
+  through Settings no longer silently discards the download the user asked for.
+- **A waiting APK now lives in `filesDir/updates`, not `cacheDir`.** The cache is reclaimable,
+  which was exactly how the deferred file could vanish mid-hand-off; `file_paths.xml` gained the
+  matching `<files-path>` root and dropped an unused, over-broad `external-files-path` one.
+- **No orphaned downloads.** Leftover `.part` files and superseded releases are pruned at the
+  start of each download, an unfinished-but-verified file is no longer stranded when the
+  activity disappears, and the stream is aborted if it exceeds the published asset size.
+- **`installedVersionName()` no longer falls back to a hardcoded `"1.0.3"`**; it uses
+  `BuildConfig.VERSION_NAME` and returns `null` (→ no prompt) rather than comparing every future
+  release against one fixed version.
+- **The class documentation and `PRIVACY.md` state the real check interval** (15 minutes, 5-minute
+  retry after a failure) instead of the 24 hours left over from an earlier revision.
+
+### Fixed — file chooser
+
+- **Camera captures are actually cleaned up.** `deliverFileChooserResult()` nulled
+  `pendingCameraUri`/`pendingCameraFile` and *then* asked the cleanup helper to delete, which
+  re-read the fields it had just cleared and so never deleted anything; the delete now runs on
+  the captured locals, and `pruneStaleCameraCaptures()` reclaims stills from earlier sessions at
+  launch. The unused `pendingCameraMime` field is gone.
+
+### Fixed — memory
+
+- **Background work no longer pins a destroyed Activity.** The update check (up to 23 s of socket
+  timeouts), the download worker, its progress messages and the reconnect HEAD probe all reached
+  the activity strongly, keeping a finished screen — WebView and bitmap heap included —
+  unreachable for the duration. They now go through `WeakReference` with a liveness re-check on
+  the main thread, the static progress-dialog handle is weak, and the queued blob poll is a
+  removable token rather than an anonymous chain in the message queue.
+
+### Fixed — security
+
+- **`intent://` links can no longer name their own target.** `openExternal()` parsed the URI and
+  launched it with only `CATEGORY_BROWSABLE` added, which is the textbook WebView
+  intent-redirection primitive (categories are not matched for explicit intents, so
+  `component=` from page content reached any exported activity). Component, selector and package
+  are now stripped, leaving an implicit browsable intent, and `browser_fallback_url` is accepted
+  only over http(s) so a failed deep link cannot smuggle in a second intent or a `file://` path.
+
+### Fixed — platform behaviour
+
+- **`getPackageArchiveInfo()` quirks no longer block all updates.** `SigningInfo` comes back empty
+  for *archive* files on several OEM builds; the verifier now retries with the legacy
+  `GET_SIGNATURES` flag and falls back to `info.signatures` before concluding `SIGNER_MISMATCH`.
+- **Pull-to-refresh works on non-Arena allow-listed pages.** It previously required a shim state
+  that is only injected on Arena origins (and only when the WebView supports the WebMessage
+  bridge), so OAuth/docs pages had no refresh gesture at all; those pages now use the native
+  root-scroll check while Arena keeps the page-reported one.
+- **Bridge origins cover every shimmed host.** `https://*.lmsys.org` was registered while the
+  shims go to all of `lmsys.org`, so a `*.lmsys.org` page got shims that no-op'd against a
+  missing `arenaAndroid` object; the two lists are now asserted to agree.
+- **System font size changes take effect without a restart** (`onConfigurationChanged` recomputes
+  `textZoom`; `fontScale` is in `android:configChanges`, so nothing else would notice).
+- **Fullscreen video no longer strands the page under the status bar**: the cached insets are
+  re-applied on exit instead of relying on `requestApplyInsets()` redispatching.
+- Removed the deprecated `onReceivedError(WebView, int, String, String)` override, which cannot
+  fire at `minSdk 26`.
+
+### Changed — tests, tooling and documents
+
+- **Audit suite: 92 → 127 checks, and Suite 10 now reads the artifact instead of the build
+  files.** It parses the committed APK's zip central directory, recomputes every v1 (JAR) digest,
+  extracts the signing certificate from the PKCS#7 blob and compares its SHA-256 against the
+  README fingerprint *and* the `release.yml` pin, reads the `versionName` out of the binary
+  manifest, and walks the APK Signing Block for v2/v3/v3.1 pair IDs. A build file can claim
+  anything; these are the checks that describe what was shipped.
+- **Committed-binary drift can no longer pass silently.** The suite fails unless the APK either
+  matches the source version or is explicitly disclosed as a historical artifact, and prints
+  warnings for what the published file lacks (current version, v3 block, bundled
+  `LICENSE`/`NOTICE`). `EXPECTED_CHECK_COUNT` is gated in `tests/runner.js`, so the counts quoted
+  in `README.md`, `RELEASE.md` and `test.sh` have to move with the suite.
+- The `Legal` check is renamed to what it actually inspects (staged assets, not the APK) and a
+  new `NOTICE` check keeps the dependency list honest — it no longer credits Material Components,
+  which the app does not link.
+- `NOTICE`/`assets/NOTICE.txt` stay byte-identical; `requirements.txt` pins `Pillow==11.3.0`
+  because the committed launcher rasters are this script's output and resampling is not stable
+  across Pillow majors.
+- Dev proxy: `body-parser`/`qs` updated (both advisories now clear, `npm audit` reports 0), a
+  Host-header pin blocks DNS rebinding while bound to loopback, WebSocket upgrades are attached
+  explicitly (they previously needed an unrelated HTTP request first), proxy error handling no
+  longer assumes an HTTP response exists for a socket upgrade, and `docker-compose.yml` publishes
+  on `127.0.0.1` only. A LAN bind now prints an explicit warning.
+- Corrected stale toolchain/version claims in `CHANGELOG` context, `REPO_GAP_ANALYSIS.md` and
+  `README.md` (Gradle **8.14.6** / AGP **8.13.2**, lock at `1.0.4`, 48 strings).
+- **The suite resolves resource names itself.** `aapt` does it at build time and this environment
+  has no JVM, so a new check re-implements the resolution: every `R.<type>.<name>` in the four Java
+  sources and every `@<type>/<name>` in the manifest has to exist under `res/`. Verified to fail on
+  a deliberately dangling reference before it was kept.
+
 ## [1.0.4] - 2026-10-18
 
 ### Changed — Build, SDK and hardening

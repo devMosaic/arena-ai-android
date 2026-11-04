@@ -13,6 +13,7 @@ import android.os.StatFs;
 import android.provider.Settings;
 import android.widget.Toast;
 
+import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 import androidx.core.content.FileProvider;
 
@@ -29,6 +30,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.lang.ref.WeakReference;
 import java.security.MessageDigest;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
@@ -40,13 +42,17 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * Behaviour:
  * <ul>
- *   <li>checks at most once every 24 hours (and only once per app process), so normal
- *       browsing never burns the unauthenticated GitHub API quota;</li>
+ *   <li>checks at most once every {@link #CHECK_INTERVAL_MS} (15 minutes) and only once per
+ *       app process, so normal browsing never burns the unauthenticated GitHub API quota;</li>
  *   <li>ignores drafts and pre-releases, and remembers versions the user skipped;</li>
  *   <li>downloads with a percentage indicator and a cancel button;</li>
  *   <li>verifies SHA-256, package name, version code and signing certificate before
  *       handing the file to the package installer (see {@link UpdateVerifier}).</li>
  * </ul>
+ *
+ * A verified APK that still needs the "install unknown apps" grant is remembered in
+ * {@link SharedPreferences}, so the deferred install survives the process being killed while
+ * the user is in Settings — and the file is re-verified when it is picked up again.
  *
  * The update UI is limited to the transient system AlertDialogs that already existed;
  * no permanent chrome is added to the Arena web interface.
@@ -62,6 +68,12 @@ public class AppUpdateManager {
     private static final String KEY_SKIPPED_VERSION = "skipped_version";
     private static final String KEY_LAST_PROMPT_VERSION = "last_prompt_version";
     private static final String KEY_LAST_PROMPT_TIME = "last_prompt_time";
+    private static final String KEY_PENDING_APK_PATH = "pending_apk_path";
+    private static final String KEY_PENDING_APK_SHA = "pending_apk_sha";
+    private static final String KEY_PENDING_APK_TAG = "pending_apk_tag";
+
+    /** Directory (under filesDir) that holds a verified APK waiting to be installed. */
+    private static final String UPDATES_DIR = "updates";
 
     /**
      * Normal spacing between successful checks. Short enough that a release published while
@@ -84,7 +96,21 @@ public class AppUpdateManager {
     private static volatile boolean promptShownThisSession = false;
     private static volatile boolean cancelled = false;
     private static volatile HttpURLConnection activeConnection = null;
+
+    /**
+     * Verified APK waiting for the installer. Also persisted to preferences as a path plus the
+     * expected checksum, because leaving the app for the "install unknown apps" screen can kill
+     * this process and a static field alone would silently drop the update the user asked for.
+     */
+    @Nullable
     private static File pendingApkInstall = null;
+
+    /**
+     * Progress dialog of the running download, so the owning activity can dismiss it on teardown
+     * instead of leaking its window (and instead of posting into a dead activity later).
+     */
+    @Nullable
+    private static volatile WeakReference<AlertDialog> activeProgressDialog = null;
 
     private AppUpdateManager() {
     }
@@ -102,6 +128,11 @@ public class AppUpdateManager {
         }
 
         final Context appContext = activity.getApplicationContext();
+        // The check runs on a thread pool with 8 s + 15 s of socket timeouts. Holding the
+        // activity strongly across that (directly, or through the prompt callback below)
+        // would keep a destroyed screen — WebView, bitmap heap and all — unreachable for the
+        // whole call, so it is reached weakly and re-checked on the main thread.
+        final WeakReference<Activity> activityRef = new WeakReference<>(activity);
         final SharedPreferences prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         long lastCheck = prefs.getLong(KEY_LAST_CHECK, 0L);
         long now = System.currentTimeMillis();
@@ -211,8 +242,9 @@ public class AppUpdateManager {
                 final String notes = sanitizeReleaseNotes(release.optString("body", ""));
 
                 mainHandler.post(() -> {
-                    if (activity.isFinishing()
-                            || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && activity.isDestroyed())) {
+                    Activity host = activityRef.get();
+                    if (host == null || host.isFinishing()
+                            || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 && host.isDestroyed())) {
                         return;
                     }
                     if (promptShownThisSession) {
@@ -231,7 +263,7 @@ public class AppUpdateManager {
                             .putString(KEY_LAST_PROMPT_VERSION, finalTag)
                             .putLong(KEY_LAST_PROMPT_TIME, nowPrompt)
                             .apply();
-                    showUpdatePrompt(activity, finalTag, finalApkUrl, finalSize, finalSha, notes);
+                    showUpdatePrompt(host, finalTag, finalApkUrl, finalSize, finalSha, notes);
                 });
             } catch (Exception ignored) {
                 // A background update check must never interrupt the user.
@@ -293,9 +325,24 @@ public class AppUpdateManager {
                 })
                 .setCancelable(false)
                 .create();
+        // Tracked so the owning activity can dismiss it on teardown; a dialog that outlives
+        // its activity leaks the window and the later post() would talk to a dead context.
+        activeProgressDialog = new WeakReference<>(progressDialog);
         progressDialog.show();
 
-        final File cacheRoot = activity.getCacheDir();
+        // The download runs for as long as the network takes, on a thread that outlives any
+        // single screen. Both the activity and its dialog are therefore reached through weak
+        // references: a strong capture here would pin a destroyed Activity (and with it the
+        // whole WebView and its bitmap heap) for the duration of the download, which LeakCanary
+        // reports as a classic "Handler on ExecutorService" retention.
+        final Context appContext = activity.getApplicationContext();
+        final WeakReference<Activity> activityRef = new WeakReference<>(activity);
+        final WeakReference<AlertDialog> dialogRef = new WeakReference<>(progressDialog);
+
+        // Deliberately filesDir, not cacheDir: a verified APK that is waiting for the
+        // "install unknown apps" grant must not be reclaimed by the cache purger while the
+        // app is backgrounded in Settings.
+        final File storageRoot = activity.getFilesDir();
         updateExecutor.execute(() -> {
             File finalFile = null;
             boolean cancelledByUser = false;
@@ -303,11 +350,14 @@ public class AppUpdateManager {
             UpdateVerifier.Result verification = null;
 
             try {
-                File updatesDir = new File(cacheRoot, "updates");
+                File updatesDir = new File(storageRoot, UPDATES_DIR);
                 if (!updatesDir.exists() && !updatesDir.mkdirs()) {
                     throw new IOException("Cannot create update directory");
                 }
                 finalFile = new File(updatesDir, "ArenaAI-" + sanitizeTag(tagName) + ".apk");
+                // Reclaim .part leftovers and any previously downloaded release that is not
+                // the one being fetched now; filesDir is not auto-purged, so this is the sweep.
+                pruneUpdateArtifacts(updatesDir, finalFile.getName());
                 File tempFile = new File(updatesDir, finalFile.getName() + ".part");
                 if (tempFile.exists() && !tempFile.delete()) {
                     throw new IOException("Cannot replace previous download");
@@ -341,16 +391,30 @@ public class AppUpdateManager {
                             digest.update(buffer, 0, read);
                             total += read;
 
+                            if (sizeBytes > 0 && total > sizeBytes) {
+                                // The published asset size is the budget. Without this an
+                                // endless stream would fill filesDir before the checksum
+                                // mismatch (if any) was ever noticed.
+                                throw new IOException("Download exceeded the published asset size");
+                            }
+
                             if (sizeBytes > 0) {
                                 int percent = (int) Math.min(100, (total * 100) / sizeBytes);
                                 if (percent >= lastProgress + 2) {
                                     lastProgress = percent;
                                     final int shownPercent = percent;
                                     mainHandler.post(() -> {
-                                        if (progressDialog.isShowing() && !activity.isFinishing()) {
-                                            progressDialog.setMessage(activity.getString(
-                                                    R.string.update_downloading_message, tagName, shownPercent));
+                                        // Cleared eagerly so the message queue never becomes the
+                                        // thing keeping a finished screen alive.
+                                        AlertDialog dialog = dialogRef.get();
+                                        Activity host = activityRef.get();
+                                        if (dialog == null || host == null
+                                                || host.isFinishing() || host.isDestroyed()
+                                                || !dialog.isShowing()) {
+                                            return;
                                         }
+                                        dialog.setMessage(host.getString(
+                                                R.string.update_downloading_message, tagName, shownPercent));
                                     });
                                 }
                             }
@@ -373,7 +437,9 @@ public class AppUpdateManager {
                                 copyFile(tempFile, finalFile);
                                 tempFile.delete();
                             }
-                            verification = UpdateVerifier.verify(activity, finalFile, expectedSha256);
+                            // Application context on purpose: verification only needs the
+                            // PackageManager, so it must not extend the activity's reach.
+                            verification = UpdateVerifier.verify(appContext, finalFile, expectedSha256);
                             if (verification.ok() && expectedSha256 != null
                                     && !expectedSha256.equalsIgnoreCase(streamedSha)) {
                                 // Belt and braces: the re-read hash is authoritative, but
@@ -400,33 +466,57 @@ public class AppUpdateManager {
 
             mainHandler.post(() -> {
                 downloading.set(false);
+                // Resolve the weak captures once, then drop them: this runnable is the last
+                // thing the download thread queues, and leaving it reachable from the handler
+                // would keep the (already destroyed) activity alive for nothing.
+                Activity host = activityRef.get();
+                AlertDialog dialog = dialogRef.get();
+                if (dialog != null && activeProgressDialog != null
+                        && activeProgressDialog.get() == dialog) {
+                    activeProgressDialog = null;
+                }
                 try {
-                    if (progressDialog.isShowing()) {
-                        progressDialog.dismiss();
+                    if (dialog != null && dialog.isShowing()) {
+                        dialog.dismiss();
                     }
                 } catch (Exception ignored) {
                 }
 
-                if (activity.isFinishing()) {
+                final boolean usable = result != null && result.ok()
+                        && downloadedFile != null && downloadedFile.exists();
+
+                if (!usable) {
+                    // Nothing verified is on disk: drop any earlier pending record with it.
+                    clearPendingInstall(appContext);
+                    deleteQuietly(downloadedFile);
+                }
+
+                if (host == null || host.isFinishing() || host.isDestroyed()) {
+                    // The screen went away mid-download. A verified APK is kept and remembered
+                    // so the installer can open on the next resume; anything else has already
+                    // been deleted above, so nothing is left behind in filesDir.
+                    if (usable) {
+                        rememberPendingInstall(appContext, downloadedFile, expectedSha256, tagName);
+                    }
                     return;
                 }
 
                 if (userCancelled) {
-                    deleteQuietly(downloadedFile);
-                    Toast.makeText(activity, R.string.update_cancelled, Toast.LENGTH_SHORT).show();
+                    Toast.makeText(host, R.string.update_cancelled, Toast.LENGTH_SHORT).show();
                     return;
                 }
                 if (failure != null) {
-                    deleteQuietly(downloadedFile);
-                    Toast.makeText(activity, failure, Toast.LENGTH_LONG).show();
+                    Toast.makeText(host, failure, Toast.LENGTH_LONG).show();
                     return;
                 }
-                if (result == null || !result.ok()) {
-                    deleteQuietly(downloadedFile);
-                    showVerificationFailure(activity, result);
+                if (!usable) {
+                    showVerificationFailure(host, result);
                     return;
                 }
-                installApk(activity, downloadedFile);
+                // Recorded before the installer opens: REQUEST_INSTALL_PACKAGES is normally not
+                // granted yet, and the round trip through Settings can kill this process.
+                rememberPendingInstall(appContext, downloadedFile, expectedSha256, tagName);
+                installApk(host, downloadedFile);
             });
         });
     }
@@ -464,6 +554,76 @@ public class AppUpdateManager {
                 .setPositiveButton(R.string.dialog_ok, (dialog, which) -> dialog.dismiss())
                 .setCancelable(true)
                 .show();
+    }
+
+    /**
+     * Records a verified APK that still needs the install permission, so the hand-off to the
+     * package installer survives this process being killed while the user is in Settings.
+     */
+    private static void rememberPendingInstall(Context context, File apk,
+                                               @Nullable String sha, String tagName) {
+        pendingApkInstall = apk;
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_PENDING_APK_PATH, apk.getAbsolutePath())
+                .putString(KEY_PENDING_APK_SHA, sha)
+                .putString(KEY_PENDING_APK_TAG, tagName)
+                .apply();
+    }
+
+    private static void clearPendingInstall(Context context) {
+        pendingApkInstall = null;
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_PENDING_APK_PATH)
+                .remove(KEY_PENDING_APK_SHA)
+                .remove(KEY_PENDING_APK_TAG)
+                .apply();
+    }
+
+    /**
+     * Reclaims leftovers in the update directory. filesDir is never purged by the platform, so
+     * abandoned {@code .part} files and superseded releases are removed here instead.
+     */
+    private static void pruneUpdateArtifacts(File dir, @Nullable String keepName) {
+        try {
+            File[] existing = dir.listFiles();
+            if (existing == null) {
+                return;
+            }
+            for (File file : existing) {
+                String name = file.getName();
+                if (name.equals(keepName)) {
+                    continue;
+                }
+                if (name.endsWith(".part")
+                        || (name.startsWith("ArenaAI-") && name.endsWith(".apk"))) {
+                    deleteQuietly(file);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * Dismisses the download dialog owned by {@code activity}. Called from
+     * {@code MainActivity.onDestroy()}: the dialog lives in a static field, so without this the
+     * window leaks and the completion callback posts into a dead activity.
+     */
+    public static void onActivityDestroyed(Activity activity) {
+        AlertDialog dialog = activeProgressDialog == null ? null : activeProgressDialog.get();
+        if (dialog == null) {
+            return;
+        }
+        activeProgressDialog = null;
+        try {
+            if (dialog.isShowing()) {
+                dialog.dismiss();
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     /**
@@ -516,19 +676,59 @@ public class AppUpdateManager {
      * settings screen.
      */
     public static void checkPendingInstall(Activity activity) {
-        if (activity == null || pendingApkInstall == null) {
+        if (activity == null) {
             return;
         }
+        final Context appContext = activity.getApplicationContext();
+        final SharedPreferences prefs =
+                appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+
+        File apk = pendingApkInstall;
+        if (apk == null) {
+            // Restored after a process death, which is the common outcome of the Settings
+            // round trip; the static field alone used to swallow the user's update there.
+            String path = prefs.getString(KEY_PENDING_APK_PATH, null);
+            if (path == null || path.trim().isEmpty()) {
+                return;
+            }
+            apk = new File(path);
+        }
+
         boolean canInstall = Build.VERSION.SDK_INT < Build.VERSION_CODES.O
                 || activity.getPackageManager().canRequestPackageInstalls();
         if (!canInstall) {
+            // Keep the record; the next onResume retries once the grant arrives.
             return;
         }
-        File apk = pendingApkInstall;
+
+        // Single-shot: the installer is never reopened twice for the same download.
         pendingApkInstall = null;
-        if (apk.exists()) {
-            installApk(activity, apk);
+
+        if (!apk.exists() || apk.length() == 0) {
+            clearPendingInstall(appContext);
+            Toast.makeText(activity, R.string.update_pending_lost, Toast.LENGTH_LONG).show();
+            return;
         }
+
+        String tag = prefs.getString(KEY_PENDING_APK_TAG, null);
+        String installed = installedVersionName(appContext);
+        if (tag != null && installed != null && !isNewerVersion(installed, tag)) {
+            // The update landed (this is the path a successful install leaves behind) or the
+            // record predates it: reclaim the file instead of offering it again.
+            clearPendingInstall(appContext);
+            deleteQuietly(apk);
+            return;
+        }
+
+        // Re-verify: the APK has been sitting on disk, possibly across a reboot.
+        String expectedSha = prefs.getString(KEY_PENDING_APK_SHA, null);
+        if (!UpdateVerifier.verify(activity, apk, expectedSha).ok()) {
+            clearPendingInstall(appContext);
+            deleteQuietly(apk);
+            return;
+        }
+
+        installApk(activity, apk);
     }
 
     // ---------------------------------------------------------------------------------
@@ -701,6 +901,13 @@ public class AppUpdateManager {
         return builder.toString();
     }
 
+    /**
+     * @return the installed {@code versionName}, or {@code null} when it cannot be determined.
+     * The caller must treat {@code null} as "do nothing": the previous fallback returned a
+     * hardcoded literal, which silently compared every release against one fixed version as
+     * soon as the version moved on.
+     */
+    @Nullable
     private static String installedVersionName(Context context) {
         try {
             PackageInfo info = context.getPackageManager()
@@ -710,7 +917,8 @@ public class AppUpdateManager {
             }
         } catch (Exception ignored) {
         }
-        return "1.0.3";
+        // Compiled into this very APK, so it can never drift out of date.
+        return BuildConfig.VERSION_NAME.isEmpty() ? null : BuildConfig.VERSION_NAME;
     }
 
     /**

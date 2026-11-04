@@ -37,7 +37,7 @@ Legend: **Done** · **Partial** · **Not done** (reason given).
 | Check | Result |
 | :--- | :--- |
 | Java compile | All 4 main sources **and** both unit-test sources compile with **0 errors** (ECJ 3.12.1, `-1.8`) against the real `android-34.jar` platform API plus stubs written to the published signatures for every AndroidX type used (`appcompat`, `activity`, `webkit`, `swiperefreshlayout`, `core`, `annotation`, `lifecycle`). No JDK/Android SDK exists in this sandbox, so this was the only compile check available locally. GitHub Actions run `39127380211` then built the branch for real: `test`, `lintDebug`, `assembleRelease`, `assembleDebug` and `scripts/verify-apk.sh` all succeeded. |
-| `npm test` | **92 / 92 passed** (11 suites) |
+| `npm test` | **127 / 127 passed** |
 | Syntax | `node --check` on `server.js` and every file in `tests/`; `py_compile` on `process_official_icon.py`; YAML parse of both workflows and `dependabot.yml` |
 | Icon generator | Re-run end-to-end into a temp directory: 10 PNGs, correct density ladder (48→192 px), RGBA |
 | Refresh gesture | The page-side gating shim was executed in a Node DOM harness: a scrolled nested container blocks the pull, returning to its top re-arms it, a scrolled root blocks it, and a scrolled off-screen container does not |
@@ -75,17 +75,17 @@ Legend: **Done** · **Partial** · **Not done** (reason given).
 
 | ID | Status | What changed |
 | :--- | :--- | :--- |
-| M1 | **Done** | `package-lock.json` regenerated; root is `arena-ai-android@1.0.3`, `private: true`. |
+| M1 | **Done** | `package-lock.json` committed and in sync with `package.json` (root `arena-ai-android@1.0.4`, `private: true`); `npm ci` is the documented install path and the audit suite asserts the two files agree. |
 | M2 | **Not done** | The tree already runs the latest `braces@3.0.3`, `micromatch@4.0.8` and `http-proxy-middleware@4.2.0`; npm's advisory has no patched release, so the only "fix" is downgrading the dev-only proxy to 0.2.0. Documented instead of shipped. |
 | M3 | **Done** | `tests/test-results.json` untracked (`git rm --cached`) and ignored. |
 | M4 | **Done** | CI now runs unit tests, `lintDebug`, `npm test`, `npm audit` (report-only), wrapper validation, Gradle/npm caching, timeouts and concurrency groups. |
-| M5 | **Done** | Gradle **8.9**, AGP **8.7.3**, `compileSdk`/`targetSdk` **35**, minSdk 26. Android 15 edge-to-edge is handled with `systemBars` + `displayCutout` inset padding, so layout is unchanged on older devices. Validated by the green CI build. |
+| M5 | **Done** | Gradle **8.14.6**, AGP **8.13.2** (set in `android/build.gradle`), `compileSdk`/`targetSdk` **35**, minSdk 26. Android 15 edge-to-edge is handled with `systemBars` + `displayCutout` inset padding, so layout is unchanged on older devices. Validated by the green CI build. |
 | M6 | **Done** | Icon script rewritten: Pillow, correct `res/` paths, density ladder, round icons, monochrome layer; `requirements.txt` added. |
 | M7 | **Done** | Dev server detects the real LAN address and puts it in the QR code. |
 | M8 | **Done** | Suite 11 drives `/api/version`, the health endpoint, `/api/arena-status` and the non-loopback URL. |
 | M9 | **Done** | README, PRIVACY, SECURITY, CONTRIBUTING, CHANGELOG, `ANALYSIS_REPORT.md` and `release_notes.md` reconciled with the code and the real artifact. |
 | M10 | **Not done** | No in-app About/privacy/licenses screen — that is exactly the "no additional UI" constraint. Mitigated by packaging `LICENSE`/`NOTICE` and linking the documents from the web-facing docs. |
-| M11 | **Partial** | All 46 native strings (plus the offline page text) moved into `res/values/strings.xml`; no `values-*` translations yet. |
+| M11 | **Partial** | All 48 native strings (plus the offline page text) moved into `res/values/strings.xml`; no `values-*` translations yet. |
 | M12 | **Done** | `ACTION_IMAGE_CAPTURE` + `FileProvider` (`cache_captures`) is offered when the chooser reports capture intent, alongside the multi-select picker. |
 | M13 | **Partial** | Outgoing `navigator.share()` → system share sheet via an origin-locked `WebMessage` bridge. Inbound deep links were **not** added: they need `/.well-known/assetlinks.json` on `arena.ai`, which this project does not control, and unverified filters would hijack link handling. |
 | M14 | **Done** | `res/xml/data_extraction_rules.xml` (cloud backup and D2D both excluded) referenced from the manifest. |
@@ -104,7 +104,7 @@ Legend: **Done** · **Partial** · **Not done** (reason given).
 
 | Item | Status | What changed |
 | :--- | :--- | :--- |
-| Toolchain (M5) | **Done** | Gradle 8.9, AGP 8.7.3, SDK 35, edge-to-edge insets |
+| Toolchain (M5) | **Done** | Gradle 8.14.6, AGP 8.13.2, SDK 35, edge-to-edge insets |
 | R8 (M21) | **Done** | `minifyEnabled`/`shrinkResources` on, keep rules reviewed, mapping uploaded |
 | Allow-list (M23) | **Done** | `google.com` and `live.com` removed; exact OAuth hosts only |
 | Contact channels (M18) | **Done** | Private advisory link + maintainer handle in SECURITY/CoC |
@@ -937,3 +937,69 @@ a = APK('ArenaAI.apk')
 print(a.package, a.version_name, a.version_code, a.get_permissions())
 PY
 ```
+
+---
+
+## Follow-up audit — 2026-11-04 (v1.0.4 source vs. v1.0.3 artifact)
+
+A second full pass read the four Java sources line by line and then **opened the committed
+`ArenaAI.apk` as bytes** instead of trusting the files that produce it. The documents and CI were
+green; the gap was that nothing had ever verified the artifact against the source, and several
+hardening claims in `1.0.4` were untestable from outside.
+
+### What the artifact actually is
+
+| Claim | Reality at `69ad1e5` |
+| :--- | :--- |
+| `releases/latest` serves the current app | **v1.0.3** — `v1.0.4` was never tagged, so the README install link and the self-updater both point at the *previous* release |
+| v1.0.4 ships signature verification | The 1.0.3 `classes.dex` contains **no** `UpdateVerifier`, no `DownloadHandler`, no `arenaAndroid` bridge and no `getPackageArchiveInfo` call — every hardening item below is *unreachable in the field* until a new release is published |
+| Signed with v1 + v2 + v3 | v1 (441 `MANIFEST.MF` entries, 438 digests recomputed, 0 mismatches) + v2; the APK Signing Block carries **no v3 block**. Build config says v3, `apksigner` output was never asserted |
+| "SHA-256 is bundled inside the APK" | Only `assets/dexopt/baseline.prof` exists — no `LICENSE`/`NOTICE` assets in the published file (the source stages them for 1.0.4+) |
+| Signing certificate `0A:78:…:DE` | **True** — openssl and the new pure-Node DER walk agree, and the same value is `EXPECTED_CERT_SHA256` in `release.yml` and the README |
+
+### Findings and dispositions
+
+| # | Finding | Severity | Disposition |
+| :--- | :--- | :--- | :--- |
+| N1 | `publish.gradle.kts:19` enables v3 while the shipped APK has no v3 block | Medium | Not a code bug — a **test-coverage** gap. Suite 10 now reads the signing block and reports it as a warning; the README discloses the historical artifact as v1 + v2 |
+| N2 | `checkPendingInstall()` dropped a verified APK whenever `isFinishing()` was true — the *install unknown apps* Settings round trip finishes an unresized activity, so the update the user just asked for vanished | **High** | Fixed: path + SHA-256 + tag persisted in `SharedPreferences`, re-verified on return |
+| N3 | Staging directory was `cacheDir` (reclaimable) and `file_paths.xml` had no matching `<files-path>`/`updates` root | Medium | Fixed: `filesDir/updates` + matching root; over-broad `external-path` root dropped |
+| N4 | `installedVersionName()` returned a hardcoded `"1.0.3"` on `NameNotFoundException` | Medium | Fixed: `BuildConfig.VERSION_NAME`, `null` → no prompt |
+| N5 | Download stream unbounded — no abort when the asset exceeds `sizeBytes`, no cap, no pruning of orphans | Medium | Fixed: size abort, `.part`/superseded pruning, bounded temp file |
+| N6 | `getPackageArchiveInfo(GET_SIGNING_INFO)` returns empty `SigningInfo` for *archive* files on several OEM builds → false `SIGNER_MISMATCH` that blocks all updates | **High** (field risk) | Fixed: `GET_SIGNATURES` retry + `info.signatures` fallback |
+| N7 | `deliverFileChooserResult()` cleared `pendingCameraUri`/`File` before calling the helper that re-reads them → camera JPEGs never deleted | Medium | Fixed: delete from the captured locals; `pruneStaleCameraCaptures()` at launch; dead `pendingCameraMime` removed |
+| N8 | `static boolean blobExportGuardInProgress` had no owner and no release on page destruction → permanent "A download is already in progress" | Medium | Fixed: owned + deadline-bounded claim, released from `onWebViewDestroyed()` |
+| N9 | `blob.size` cap enforced Java-side after the base64 `String` was already built in the renderer | Medium | Fixed: enforced in-page before `readAsDataURL()`; `data:` capped before decoding |
+| N10 | `'`/`\`-only escaping when injecting a URL into `new Function` | Low | Fixed: `\uXXXX` encoder |
+| N11 | `Intent.parseUri(...)` + `startActivity` from page-supplied text — intent redirection primitive; popups could open popups; `ACTION_VIEW` with `TYPE_APPLICATION_ARCHIVE` | **High** (defence in depth) | Fixed: component/selector/package stripped, fallback URL scheme-checked, nested popups refused, explicit archive MIME + grant |
+| N12 | Pull-to-refresh structurally impossible on non-Arena allow-listed pages; `canPullToRefresh` re-read the live field instead of the captured snapshot; `overScrollBy` fallback was unreachable | Low | Fixed: native root-scroll check off-Arena, snapshot + `pageLoading` guard |
+| N13 | `https://*.lmsys.org` shimmed but not a bridge origin → shims no-op with no `arenaAndroid` | Medium | Fixed: origin list widened and asserted against `SHIMMED_HOSTS` |
+| N14 | Statics/anonymous Runnables pinned a destroyed Activity: `activeProgressDialog` (whole `ContextThemeWrapper` graph), update worker + progress posts (up to 23 s of socket timeouts), the 120-tick blob poll (and called `evaluateJavascript` on a dead WebView), the reconnect probe (~5 s past `onDestroy`, `conn` never disconnected) | Medium (leak) | Fixed: `WeakReference` owner/host/dialog, removable tracked poll token, `try/finally { conn.disconnect() }`, liveness re-checks on the main thread |
+| N15 | PRIVACY claimed a 24 h check cadence (code: 15 min + 5 min retry); `NOTICE` credited Material Components the app does not link; README badge and `RELEASE.md`/`test.sh` quoted a check count no run produced | Medium (docs) | Fixed in the documents, and the suite now asserts the cadence string, the NOTICE inventory, and that the quoted count equals the declared one |
+| N16 | Dev proxy: WebSocket upgrades attached only lazily; error handler assumed an HTTP response (crash on a socket upgrade); bound on all interfaces with no Host pin; `docker-compose.yml` published `3000:3000`; `Pillow` unpinned while its output is committed | Medium (dev) | Fixed: explicit `server.on('upgrade')`, protocol-agnostic handler, loopback Host pin + `ALLOWED_HOSTS`, `127.0.0.1:3000:3000`, `Pillow==11.3.0` |
+
+### Still open by construction
+
+1. **Publish v1.0.4.** Until a tag exists, `releases/latest` serves 1.0.3 and *none* of the fixes
+   above reach a user — including the updater fixes, since the shipped binary has no verifier.
+2. **`reproducible-artifacts: false`.** `apksigner` output (signing schemes, cert fingerprint) is
+   now cross-checked by the suite, but `verify-apk.sh` still cannot run `aapt`/`apksigner` in this
+   sandbox, so that half remains human-executed.
+3. **Icon generator is correct but not byte-reproducible.** Run against `android/app/src/main/res`
+   it rewrites 10 assets with the right structure and slightly different bytes (PNG chunks carry no
+   timestamps; the difference is Pillow's encoder). Re-running it is therefore safe in content, and
+   Pillow is now pinned to reduce even that.
+4. **No on-device verification.** No emulator, no instrumentation tests, no OEM matrix — N6 in
+   particular is exactly the class of bug that only shows up on specific vendor ROMs.
+5. **No compiler.** `java`/`javac`/`gradle`/`aapt` are absent and `dl.google.com`,
+   `services.gradle.org` and the apt mirrors are outside this sandbox's network allow-list, so
+   nothing here can be compiled — only parsed (tree-sitter), resource-resolved and grepped. The
+   build has to happen on a real toolchain before merge.
+
+### Retained as-is after review
+
+`Intent.parseUri` sanitising, popup teardown, offline/reconnect handling and the safe-browsing and
+cleartext settings were re-read this pass and found correct. Two further items were measured rather
+than assumed: a symbol-resolution sweep over the four sources (every bare call, `this.` field and
+undeclared identifier) returned only inherited Android/Java framework members, and the new resource
+check confirms all 48 strings, 3 drawables, both `xml/` roots and every manifest reference resolve.

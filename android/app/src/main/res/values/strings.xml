@@ -58,4 +58,5 @@
     <string name="update_reason_parse">The downloaded file is not a valid APK.</string>
     <string name="update_install_permission">Please allow Arena AI to install updates, then return to complete.</string>
     <string name="update_install_failed">Could not open the installer: %1$s</string>
+    <string name="update_pending_lost">The downloaded update is no longer available. Please download it again.</string>
 </resources>

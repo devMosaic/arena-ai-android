@@ -47,6 +47,41 @@ function findLanAddress(bindHost) {
   return preferred || { name: 'Loopback', address: '127.0.0.1' };
 }
 
+/**
+ * Rejects requests whose Host header is not an address this server actually listens on.
+ * A loopback-bound dev proxy that forwards session cookies is exactly the shape DNS
+ * rebinding targets: a page in a local browser can resolve an attacker domain to
+ * 127.0.0.1 and ride the proxy. Pinning Host makes that request fail before it gets there.
+ *
+ * Only applied while bound to loopback. Binding to 0.0.0.0 is a deliberate choice to expose
+ * the proxy on the LAN (phone testing, Docker port publishing) where the Host the client
+ * sends is the *host machine's* address, not this process's; those setups get the startup
+ * warning instead. Extra names can be added with ALLOWED_HOSTS=a,b.
+ */
+const LOOPBACK_BIND = !HOST || HOST === '127.0.0.1' || HOST === 'localhost';
+const ALLOWED_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+for (const extra of String(process.env.ALLOWED_HOSTS || '').split(',')) {
+  if (extra.trim()) ALLOWED_HOSTS.add(extra.trim());
+}
+try {
+  ALLOWED_HOSTS.add(findLanAddress(HOST).address);
+} catch (e) {
+  /* interface enumeration failed; the explicit values above still apply */
+}
+
+app.use((req, res, next) => {
+  if (!LOOPBACK_BIND) {
+    next();
+    return;
+  }
+  const hostname = String(req.headers.host || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+  if (hostname && !ALLOWED_HOSTS.has(hostname)) {
+    res.status(403).json({ error: 'Forbidden: unexpected Host header for a loopback-only dev proxy' });
+    return;
+  }
+  next();
+});
+
 // 1. Diagnostics & Health Endpoints
 app.get('/api/health', (req, res) => {
   res.json({
@@ -152,8 +187,11 @@ const arenaProxy = createProxyMiddleware({
     },
     error: (err, req, res) => {
       console.error('Proxy Error:', err.message);
-      if (!res.headersSent) {
+      if (res && typeof res.status === 'function' && !res.headersSent) {
         res.status(502).send('Error connecting to Arena.ai.');
+      } else if (res && typeof res.write === 'function' && typeof res.end === 'function') {
+        // WebSocket upgrade failures have no HTTP response object to answer with.
+        try { res.end(); } catch (e) { /* socket already gone */ }
       }
     }
   }
@@ -163,6 +201,13 @@ app.use(arenaProxy);
 
 // Start Server bound to loopback by default for security
 const server = app.listen(PORT, HOST, () => {
+  // http-proxy-middleware only self-attaches its 'upgrade' listener once an HTTP
+  // request has passed through it, so a WebSocket-only client would never be proxied.
+  // Wiring it explicitly makes ws:// handling independent of that first request.
+  if (typeof arenaProxy.upgrade === 'function') {
+    server.on('upgrade', arenaProxy.upgrade);
+  }
+
   const lan = findLanAddress(HOST);
   console.log('================================================================');
   console.log('  ARENA.AI LOCAL DEVELOPMENT PROXY ACTIVE                       ');
@@ -175,6 +220,12 @@ const server = app.listen(PORT, HOST, () => {
   if (HOST === '127.0.0.1' || HOST === 'localhost') {
     console.log('  Tip:              Set HOST=0.0.0.0 to make the LAN URL/QR   ');
     console.log('                    reachable from a phone on the same network.');
+  } else {
+    console.log('  WARNING:          Bound to all interfaces. This proxy forwards');
+    console.log('                    arena.ai cookies and needs no authentication,');
+    console.log('                    so anyone on your network can use this port as');
+    console.log('                    a signed-in relay to Arena while it is running.');
+    console.log('                    Stop it when you are done, or use 127.0.0.1.');
   }
   console.log('================================================================');
 });

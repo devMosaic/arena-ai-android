@@ -23,10 +23,10 @@ This software incorporates components governed by open-source licenses:
    Licensed under the Apache License, Version 2.0:
    http://www.apache.org/licenses/LICENSE-2.0
 
-2. Material Components for Android
-   Copyright (c) Google LLC
-   Licensed under the Apache License, Version 2.0:
-   http://www.apache.org/licenses/LICENSE-2.0
-
-3. JUnit & AndroidX Test Libraries
+2. JUnit & AndroidX Test Libraries
    Licensed under the Eclipse Public License 1.0 and Apache License, Version 2.0
+
+The list above is limited to the dependencies declared in android/app/build.gradle and
+their AndroidX transitive requirements (appcompat pulls in core, fragment, lifecycle,
+emoji2 and res-*-internal, which are covered by the same Apache 2.0 terms). It is kept in
+sync by an audit check, so a component that is not actually linked in must not be listed.

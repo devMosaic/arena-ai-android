@@ -76,7 +76,7 @@ In **v1.0.2**, the application resolves the scroll-up accidental reload issue by
 
 ## 5. Automated Verification Results
 
-- **Test Suite Status:** 92 / 92 Passing (100% Success Rate)
+- **Test Suite Status:** 127 / 127 Passing (100% Success Rate)
 - **Suite Breakdown:**
   - Suite 1: Local Development Server & Diagnostics (2/2 passing)
   - Suite 2: Android Architecture & Security Hardening (13/13 passing)
@@ -109,8 +109,73 @@ in the current source tree.
 - Native `alert`/`confirm`/`prompt` and `beforeunload` dialogs.
 - Fullscreen HTML5 video, `intent://` deep links, and share-sheet bridging for `navigator.share`.
 - OAuth popup tracking/teardown, renderer-crash recovery, HTTP 5xx and TLS error handling.
-- Throttled updater (24 h) with skip-version, progress, cancel, free-space checks and atomic file replacement.
+- Throttled updater (once per 15 minutes while foregrounded, 5-minute retry after a failure) with
+  skip-version, progress, cancel, free-space checks and atomic file replacement.
 - `LICENSE`/`NOTICE` bundled in the APK; Android 12+ data-extraction rules; predictive-back opt-in.
 
 No native navigation, toolbar, banner or menu was added: every screen still comes from
 the Arena web app, and native code only supplies system-level capabilities.
+
+---
+
+## 7. 2026-11-04 Follow-Up — Artifact-Level Audit and Hardening
+
+The previous two passes verified the *sources and the pipeline*. This one opened the published
+`ArenaAI.apk` as bytes and read all four Java files line by line, then fixed what it found. The
+documents and CI were green before this pass; the point is that neither had ever been checked
+against the artifact.
+
+### 7.1 What the published artifact actually is
+
+| Question | Answer from the bytes |
+| :--- | :--- |
+| Which release does `releases/latest` serve? | **v1.0.3** — `versionName`/`versionCode` inside the binary manifest read `1.0.3` / `4`, while the source on this branch is `1.0.4` / `5`. There is no `v1.0.4` tag, so the README install link and the self-updater both point at the previous release |
+| Does the shipped binary contain the v1.0.4 hardening? | **No.** `classes.dex` has no `UpdateVerifier`/`DownloadHandler` class strings, no `arenaAndroid` bridge name, no `SHA-256` and no `getPackageArchiveInfo` call. The published updater verifies nothing before launching the installer |
+| Signature schemes? | v1 (441 `MANIFEST.MF` entries; 438 digests recomputed against the zip, **0** mismatches) + v2. The APK Signing Block carries `v2` and the verified-SDK/proof-of-rotation pairs only — **no v3 block** |
+| Is the signing key the advertised one? | **Yes.** The X.509 extracted from `META-INF/CERT.RSA` (independent DER walk and openssl agree) fingerprints to `0A:78:…:F2:DE`, the same value as `EXPECTED_CERT_SHA256` in `release.yml:22` and the README |
+| Are `LICENSE`/`NOTICE` inside the APK? | **No** — the only entry under `assets/` is `dexopt/baseline.prof`. The source stages them for the next build; the wording that claimed they were already in the published file was corrected |
+
+`unzip -t` is clean, the CMS signature verifies, and the root `SHA256SUMS` matches. The artifact is
+intact and honestly signed — it is simply *old*, and the suite now prints that as warnings
+(`1.0.3` vs `1.0.4`, no v3 block, no bundled assets) instead of letting a green build imply it is
+current.
+
+### 7.2 Fixes shipped in this pass
+
+| Area | Finding → change |
+| :--- | :--- |
+| Updater | A verified APK waiting on the *install unknown apps* grant was dropped when the activity finished (`isFinishing()` is true after the Settings round trip) → path + expected SHA-256 + tag persisted in `SharedPreferences` and **re-verified** before the installer reopens. Staging moved from the reclaimable `cacheDir` to `filesDir/updates` with a matching `file_paths.xml` root; orphans pruned; the stream aborts past the published asset size; `installedVersionName()` uses `BuildConfig.VERSION_NAME` instead of a hardcoded `"1.0.3"`; `PRIVACY.md`/javadoc now state the real 15-minute cadence |
+| Verifier | OEM builds return an empty `SigningInfo` for *archive* files, which read as `SIGNER_MISMATCH` and blocked every update → retry with the legacy `GET_SIGNATURES` flag and fall back to `info.signatures` |
+| Downloads | `static boolean blobExportGuardInProgress` could leak permanently when a poll's callback never arrived, wedging every later export → owned (`WeakReference<WebView>`) + deadline-bounded claim released by `onWebViewDestroyed()`; the 48 MB ceiling now applies to `blob.size` in-page before the base64 copy is built (and to `data:` before decoding); blob URLs injected through a `\uXXXX` encoder instead of `'`/`\` escaping |
+| File chooser | Camera cleanup read back fields it had just nulled, so every capture stayed on disk forever → deletes from the captured locals, plus `pruneStaleCameraCaptures()` at launch and removal of the dead `pendingCameraMime` |
+| Intents | `Intent.parseUri` + `startActivity` from page text was an intent-redirection primitive (categories are not matched for explicit intents) → `component`/`selector`/`package` stripped, `browser_fallback_url` restricted to http(s); popups can no longer open popups; the installer now gets an explicit archive MIME + read grant rather than `ACTION_VIEW` MIME guessing |
+| Memory | Four retention chains removed: the static progress `AlertDialog` (pinned the whole destroyed `ContextThemeWrapper` graph), the update worker and its progress posts (up to 23 s of socket timeouts holding a dead Activity), the 120-tick blob poll (which also called `evaluateJavascript` on a destroyed WebView), and the reconnect `HEAD` probe (~5 s past `onDestroy`, connection never disconnected) |
+| Peak heap | Retention was only half of it: a download's base64 payload was copied out of the incoming `String` with `substring()` and then decoded into a fresh `byte[]`, so an export at the permitted 48 MB ceiling peaked near **240 MB live** — past the default per-app heap limit on many devices, i.e. an out-of-memory kill at a size the ceiling explicitly allows. The payload now decodes from the original string region straight into the destination through one reusable 64 KB buffer (`AsciiRegionStream` + `Base64.getMimeDecoder().wrap`), which re-checks the ceiling while copying; a failed MediaStore write also deletes its pending row instead of leaving a zero-length download |
+| Platform | Pull-to-refresh falls back to the native root-scroll check off-Arena (it was structurally impossible on `accounts.google.com`, `github.com/login/oauth`, `lmsys.org`, …) and uses the captured snapshot; `https://*.lmsys.org` is now a bridge origin and the two host lists are asserted equal; `onConfigurationChanged` applies system font scale; cached insets re-applied on exiting fullscreen; deprecated `onReceivedError` overload removed; the MainActivity typo fixed |
+| Tooling | Dev proxy: WebSocket upgrades attached explicitly (`server.on('upgrade')`), error handling no longer assumes an HTTP response, loopback `Host` pinning with `ALLOWED_HOSTS`, LAN bind warning; `docker-compose.yml` publishes on `127.0.0.1` only; `requirements.txt` pins `Pillow==11.3.0`; `npm audit fix` → 0 vulnerabilities; `NOTICE` no longer credits Material Components and is re-staged as `assets/NOTICE.txt` |
+| Tests | **92 → 127 checks.** Suite 10 now reads the APK itself (zip central directory, v1 digest recomputation, PKCS#7 cert DER walk vs. the README fingerprint and the CI pin, binary-manifest `versionName`, signing-block scheme IDs), fails on undisclosed committed-binary drift, asserts the new behavioural invariants, and `EXPECTED_CHECK_COUNT` is gated in `tests/runner.js` so every quoted count has to move with the suite |
+
+### 7.3 Release state
+
+- **Not release-ready as v1.0.4** until a `v1.0.4` tag + release exists; publishing is what makes
+  any of the above reachable by users of 1.0.3.
+- **No build is possible in this sandbox, by network policy rather than missing packages.**
+  `java`, `javac`, `gradle`, `aapt` and `apksigner` are all absent, `apt-get` cannot even locate
+  `openjdk-17-jdk-headless`, and the only reachable hosts are `github.com`, `codeload.github.com`,
+  `api.github.com`, `registry.npmjs.org`, `pypi.org` and `files.pythonhosted.org` — so
+  `dl.google.com` (Android SDK, AGP, AndroidX) and `services.gradle.org` (the wrapper distribution,
+  `gradle-8.14.6-bin.zip`) are unreachable. Installing a JDK would not be enough; the dependency
+  graph cannot be fetched at all. **`./gradlew test assembleRelease` on a real toolchain is required
+  before tagging.**
+- What was done instead, so "unverified" does not mean "unchecked": the four sources were parsed
+  with a Java grammar (0 error nodes); a symbol sweep over every bare call, `this.` field access and
+  undeclared identifier returned only inherited framework members (no typos, and no lingering
+  reference to the removed `pendingCameraMime`); every `R.<type>.<name>` in Java and every
+  `@<type>/<name>` in the manifest was confirmed to exist under `res/` — now a permanent audit-suite
+  check, since `aapt` is exactly what would catch that class of error; and all manifest/XML files
+  parse as well-formed XML. Signature and arity of every changed method were re-read at each call
+  site by hand.
+- No emulator or device: nothing here is on-device verified, which matters most for the OEM
+  `SigningInfo` quirk and the camera-capture cleanup.
+- `reproducible-artifacts` remains `false`; the icon generator produces the right structure but is
+  not byte-reproducible across Pillow versions.

@@ -2,10 +2,197 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { execSync } = require('child_process');
 
 const PORT = process.env.PORT || 3000;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+
+/**
+ * Number of logTest() results the suite is expected to produce. Kept next to the count so
+ * that adding a check without updating the documents that quote it fails the build.
+ */
+const EXPECTED_CHECK_COUNT = 127;
+
+// ---------------------------------------------------------------------------------------
+// APK readers. These parse the *artifact* rather than the source text, so a claim about the
+// shipped binary (its version, its signatures, its signing key, its integrity) is checked
+// against bytes instead of against a sentence in a build file.
+// ---------------------------------------------------------------------------------------
+
+function findEndOfCentralDirectory(buf) {
+  const minOffset = Math.max(0, buf.length - 65558);
+  for (let i = buf.length - 22; i >= minOffset; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function listZipEntries(buf) {
+  const eocd = findEndOfCentralDirectory(buf);
+  if (eocd < 0) {
+    return [];
+  }
+  const total = buf.readUInt16LE(eocd + 10);
+  let pointer = buf.readUInt32LE(eocd + 16);
+  const entries = [];
+  for (let i = 0; i < total; i++) {
+    if (pointer + 46 > buf.length || buf.readUInt32LE(pointer) !== 0x02014b50) {
+      break;
+    }
+    const method = buf.readUInt16LE(pointer + 10);
+    const compressedSize = buf.readUInt32LE(pointer + 20);
+    const nameLength = buf.readUInt16LE(pointer + 28);
+    const extraLength = buf.readUInt16LE(pointer + 30);
+    const commentLength = buf.readUInt16LE(pointer + 32);
+    const localOffset = buf.readUInt32LE(pointer + 42);
+    const name = buf.slice(pointer + 46, pointer + 46 + nameLength).toString('utf8');
+    const dataOffset = localOffset + 30
+      + buf.readUInt16LE(localOffset + 26)
+      + buf.readUInt16LE(localOffset + 28);
+    entries.push({ name, method, compressedSize, localOffset, dataOffset });
+    pointer += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
+
+function readZipEntry(buf, entry) {
+  const raw = buf.slice(entry.dataOffset, entry.dataOffset + entry.compressedSize);
+  if (entry.method === 0) {
+    return raw;
+  }
+  if (entry.method !== 8) {
+    throw new Error(`unsupported zip method ${entry.method}`);
+  }
+  return zlib.inflateRawSync(raw);
+}
+
+/** Reads the APK Signing Block and returns the pair IDs it contains. */
+function signingBlockIds(buf) {
+  const eocd = findEndOfCentralDirectory(buf);
+  if (eocd < 0) {
+    return [];
+  }
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  const magic = buf.lastIndexOf(Buffer.from('APK Sig Block 42'));
+  if (magic < 0 || magic > cdOffset) {
+    return [];
+  }
+  const ids = [];
+  try {
+    const blockSize = Number(buf.readBigUInt64LE(magic - 8));
+    const start = magic + 16 - 8 - blockSize;
+    let pos = start + 8;
+    const end = magic - 8;
+    while (pos + 12 <= end) {
+      const pairSize = Number(buf.readBigUInt64LE(pos));
+      if (pairSize <= 4 || pos + 8 + pairSize > end + 64) {
+        break;
+      }
+      ids.push(buf.readUInt32LE(pos + 8));
+      pos += 8 + pairSize;
+    }
+  } catch (err) {
+    return ids;
+  }
+  return ids;
+}
+
+const APK_SIGNATURE_SCHEME_V2_BLOCK_ID = 0x7109871a;
+const APK_SIGNATURE_SCHEME_V3_BLOCK_ID = 0xf05368c0;
+const APK_SIGNATURE_SCHEME_V31_BLOCK_ID = 0x1b93ad61;
+
+function readDerLength(buf, offset) {
+  const first = buf[offset];
+  if (first < 0x80) {
+    return { length: first, size: 1 };
+  }
+  const count = first & 0x7f;
+  let length = 0;
+  for (let i = 0; i < count; i++) {
+    length = length * 256 + buf[offset + 1 + i];
+  }
+  return { length, size: 1 + count };
+}
+
+/**
+ * Locates the X.509 certificate inside a PKCS#7 blob (META-INF/*.RSA) by matching the
+ * Certificate shape: SEQUENCE { SEQUENCE { [0] { INTEGER 2 } ... } ... }.
+ */
+function findCertificate(der) {
+  for (let i = 0; i + 8 < der.length; i++) {
+    if (der[i] !== 0x30) {
+      continue;
+    }
+    const outer = readDerLength(der, i + 1);
+    const outerBody = i + 1 + outer.size;
+    if (outer.length < 200 || outer.length > 4096 || outerBody + 8 > der.length) {
+      continue;
+    }
+    if (der[outerBody] !== 0x30) {
+      continue;
+    }
+    const tbs = readDerLength(der, outerBody + 1);
+    const tbsBody = outerBody + 1 + tbs.size;
+    if (tbsBody + 5 > der.length) {
+      continue;
+    }
+    if (der[tbsBody] === 0xa0 && der[tbsBody + 1] === 0x03
+        && der[tbsBody + 2] === 0x02 && der[tbsBody + 3] === 0x01 && der[tbsBody + 4] === 0x02) {
+      return der.slice(i, outerBody + outer.length);
+    }
+  }
+  return null;
+}
+
+function certificateFingerprint(der) {
+  const cert = findCertificate(der);
+  if (!cert) {
+    return null;
+  }
+  return crypto.createHash('sha256').update(cert).digest('hex').toUpperCase().match(/../g).join(':');
+}
+
+/** Recomputes every META-INF/MANIFEST.MF digest against the archive entries themselves. */
+function verifyJarDigests(buf, entries) {
+  const manifestEntry = entries.find((e) => e.name.toUpperCase() === 'META-INF/MANIFEST.MF');
+  if (!manifestEntry) {
+    return { checked: 0, mismatches: 0, skipped: 0 };
+  }
+  const text = readZipEntry(buf, manifestEntry).toString('utf8').replace(/\r\n /g, '');
+  let current = null;
+  let checked = 0;
+  let mismatches = 0;
+  let skipped = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (line.startsWith('Name: ')) {
+      current = line.slice(6).trim();
+      continue;
+    }
+    const match = /^(SHA!?-256|SHA-256|SHA1|SHA-1)[- ]?Digest:\s*(.+)$/i.exec(line.trim());
+    if (!match || !current) {
+      continue;
+    }
+    const entry = entries.find((e) => e.name === current);
+    if (!entry) {
+      skipped++;
+      continue;
+    }
+    try {
+      const algorithm = /sha.?1/i.test(match[1]) ? 'sha1' : 'sha256';
+      const actual = crypto.createHash(algorithm).update(readZipEntry(buf, entry)).digest('base64');
+      checked++;
+      if (actual !== match[2].trim()) {
+        mismatches++;
+      }
+    } catch (err) {
+      skipped++;
+    }
+  }
+  return { checked, mismatches, skipped };
+}
 
 // Test Collector
 const results = {
@@ -188,6 +375,61 @@ async function runAllTests() {
   logTest('Android Build', 'ProGuard / R8 Rules Present',
     fs.existsSync(proguardPath) && fs.readFileSync(proguardPath, 'utf8').includes('ai.arena.mobile'));
 
+  // aapt resolves resource names at build time. There is no JVM in this environment, so the
+  // resolution is re-implemented here: every R.<type>.<name> in the Java sources and every
+  // @<type>/<name> in the manifest has to point at something that actually exists under res/.
+  // This is the check that catches a renamed or forgotten drawable, which otherwise only fails
+  // on the first real build.
+  logTest('Android Build', 'every resource reference in Java and the manifest resolves', (() => {
+    const listing = (dir) => {
+      try {
+        return fs.readdirSync(dir);
+      } catch (err) {
+        return [];
+      }
+    };
+    const pool = (type) => {
+      const names = new Set();
+      for (const dir of listing(resDir).filter((d) => d === type || d.startsWith(`${type}-`))) {
+        for (const file of listing(path.join(resDir, dir))) {
+          names.add(file.replace(/(\.9)?\.(xml|png|webp|jpg|jpeg|gif)$/, ''));
+        }
+      }
+      for (const values of listing(path.join(resDir, 'values')).filter((f) => f.endsWith('.xml'))) {
+        const text = fs.readFileSync(path.join(resDir, 'values', values), 'utf8');
+        for (const m of text.matchAll(/<(?:string|color|dimen|integer|bool|string-array|style)\s+name="([^"]+)"/g)) {
+          names.add(m[1]);
+        }
+      }
+      return names;
+    };
+    const kinds = ['string', 'drawable', 'mipmap', 'xml', 'layout', 'color', 'style', 'dimen'];
+    const pools = {};
+    for (const kind of kinds) {
+      pools[kind] = pool(kind);
+    }
+    const javaSrc = ['MainActivity', 'DownloadHandler', 'AppUpdateManager', 'UpdateVerifier']
+      .map((name) => path.join(srcDir, 'java', 'ai', 'arena', 'mobile', `${name}.java`))
+      .filter((p) => fs.existsSync(p))
+      .map((p) => fs.readFileSync(p, 'utf8'))
+      .join('\n');
+    const manifestSrc = fs.readFileSync(manifestPath, 'utf8');
+
+    for (const m of javaSrc.matchAll(/(?<!android\.)\bR\.(string|drawable|mipmap|xml|layout|color|style|dimen)\.([A-Za-z_]\w*)/g)) {
+      if (!pools[m[1]] || !pools[m[1]].has(m[2])) {
+        return false;
+      }
+    }
+    for (const m of manifestSrc.matchAll(/"@\+?(string|drawable|mipmap|xml|layout|color|style|dimen)\/([A-Za-z_]\w*)"/g)) {
+      if (!pools[m[1]] || !pools[m[1]].has(m[2])) {
+        return false;
+      }
+    }
+    // A declared-but-unreferenced string is harmless; an unreferenced *file* under drawable/
+    // would be dead weight, so flag only the reverse direction that actually breaks a build.
+    return pools.string.size > 0 && pools.drawable.size > 0 && pools.mipmap.size > 0;
+  })());
+
   // --- Suite 3: Adaptive Icons & Branding ---
   console.log('\n▶ SUITE 3: Official Brand Icons & Adaptive Drawables');
   const bgVector = path.join(resDir, 'drawable', 'ic_launcher_background.xml');
@@ -316,6 +558,39 @@ async function runAllTests() {
   logTest('Web Bridge', 'Client-generated blob: and data: downloads are preserved',
     downloadSrc.includes('startsWith("blob:")') && downloadSrc.includes('startsWith("data:")'));
 
+  // The size ceiling has to be applied where the bytes are still small: checking a length on
+  // the Java side happens after the renderer has already built the base64 copy, i.e. after the
+  // memory spike the limit was meant to prevent.
+  logTest('Downloads', 'blob size ceiling is enforced inside the page, before the base64 copy',
+    downloadSrc.includes('b.size>') && downloadSrc.includes('TOO_LARGE'));
+
+  logTest('Downloads', 'a destroyed WebView cannot wedge every later blob download',
+    downloadSrc.includes('blobLockOwner') && downloadSrc.includes('blobLockDeadline')
+    && downloadSrc.includes('onWebViewDestroyed')
+    && mainActivitySrc.includes('DownloadHandler.onWebViewDestroyed'));
+
+  logTest('Downloads', 'page-injected URLs are escaped as JavaScript string literals',
+    downloadSrc.includes('private static String toJavaScriptStringLiteral')
+    && downloadSrc.includes('+ safeUrl +')
+    && !downloadSrc.includes('fetch(\'"'));
+
+  logTest('Downloads', 'a data: download is size-capped before it is decoded',
+    /if \(url\.length\(\) > MAX_BLOB_BYTES/.test(downloadSrc));
+
+  // Base64 of a permitted 48 MB export is a ~64 MB String already resident on the Java side.
+  // Copying it (substring) and then decoding it into a fresh array put peak heap near 240 MB,
+  // which is over the default per-app limit on many devices — an OOM at a size the ceiling
+  // explicitly allows. Both now stream through one reusable buffer.
+  logTest('Downloads', 'base64 payloads are streamed to disk, not copied and re-decoded',
+    downloadSrc.includes('Base64.getMimeDecoder().wrap(new AsciiRegionStream')
+    && !downloadSrc.includes('Base64.decode(')
+    && !downloadSrc.includes('String payload =')
+    && (downloadSrc.match(/copyCapped\(/g) || []).length >= 3);
+
+  logTest('Downloads', 'a failed MediaStore write does not leave a pending row behind',
+    downloadSrc.includes('getContentResolver().delete(item, null, null)')
+    && downloadSrc.includes('throw new IOException("MediaStore refused the download")'));
+
   logTest('Web Bridge', 'Camera capture offered when the page requests capture',
     mainActivitySrc.includes('isCaptureEnabled')
     && mainActivitySrc.includes('ACTION_IMAGE_CAPTURE')
@@ -341,6 +616,41 @@ async function runAllTests() {
 
   logTest('Web Bridge', 'intent:// links and browser_fallback_url are honoured',
     mainActivitySrc.includes('Intent.parseUri') && mainActivitySrc.includes('browser_fallback_url'));
+
+  // Presence of parseUri is the capability; removing the target it names is the safety.
+  // Without this the shell is the textbook WebView intent-redirection primitive.
+  logTest('Web Bridge', 'intent:// targets cannot name a component, package or selector',
+    mainActivitySrc.includes('setComponent(null)')
+    && mainActivitySrc.includes('setSelector(null)')
+    && mainActivitySrc.includes('setPackage(null)'));
+
+  logTest('Web Bridge', 'browser_fallback_url is restricted to http(s)',
+    mainActivitySrc.includes('readBrowserFallbackUrl')
+    && /if \(!lower\.equals\("https"\) && !lower\.equals\("http"\)\)/.test(mainActivitySrc));
+
+  logTest('Web Bridge', 'the bridge is registered for every host that receives the shims',
+    (() => {
+      // INTERNAL_HOST_SUFFIXES decides where the JS shims are injected; the WebMessageListener
+      // origins decide which pages get window.arenaAndroid at all. A host in the first list but
+      // not the second gets shims that silently no-op, which reads as a dead pull-to-refresh.
+      const internal = /INTERNAL_HOST_SUFFIXES[\s\S]*?Arrays\.asList\(([\s\S]*?)\)\s*;/.exec(mainActivitySrc);
+      const origins = /Set<String> origins[\s\S]*?Arrays\.asList\(([\s\S]*?)\)\s*;/.exec(mainActivitySrc);
+      if (!internal || !origins) {
+        return false;
+      }
+      const hosts = [...internal[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+      const registered = [...origins[1].matchAll(/"https:\/\/([^"]+)"/g)].map((m) => m[1]);
+      return hosts.length > 0 && hosts.every((host) =>
+        registered.includes(host) || registered.includes(`*.${host}`));
+    })());
+
+  logTest('Web Bridge', 'system font size changes are applied without recreating the page',
+    mainActivitySrc.includes('onConfigurationChanged')
+    && mainActivitySrc.includes('setTextZoom(systemFontZoom())'));
+
+  logTest('File Uploads', 'abandoned camera captures are reclaimed, and the MIME hint is not dead code',
+    mainActivitySrc.includes('pruneStaleCameraCaptures')
+    && !mainActivitySrc.includes('pendingCameraMime'));
 
   logTest('Web Bridge', 'Renderer crashes and HTTP/SSL failures are recovered',
     mainActivitySrc.includes('onRenderProcessGone')
@@ -374,6 +684,88 @@ async function runAllTests() {
 
   logTest('Updater', 'Install permission is required before opening the installer',
     updateManagerSrc.includes('canRequestPackageInstalls'));
+
+  // Walking out to Settings backgrounds the app, which is exactly when the system is most
+  // likely to reclaim the process; a static field alone loses the update the user asked for.
+  logTest('Updater', 'a deferred install survives the process being killed in Settings',
+    updateManagerSrc.includes('KEY_PENDING_APK_PATH')
+    && updateManagerSrc.includes('rememberPendingInstall')
+    && updateManagerSrc.includes('clearPendingInstall'));
+
+  logTest('Updater', 'a resumed install is re-verified before the installer opens',
+    /checkPendingInstall[\s\S]*UpdateVerifier\.verify/.test(updateManagerSrc));
+
+  logTest('Updater', 'a waiting APK lives in filesDir, not the purgeable cache',
+    updateManagerSrc.includes('getFilesDir()')
+    && !updateManagerSrc.includes('getCacheDir()')
+    && fs.readFileSync(path.join(srcDir, 'res', 'xml', 'file_paths.xml'), 'utf8')
+      .includes('<files-path name="files_updates" path="updates"'));
+
+  logTest('Updater', 'the download cannot outlive the published asset size',
+    updateManagerSrc.includes('exceeded the published asset size'));
+
+  logTest('Updater', 'the progress dialog is torn down with its activity',
+    updateManagerSrc.includes('public static void onActivityDestroyed')
+    && mainActivitySrc.includes('AppUpdateManager.onActivityDestroyed'));
+
+  logTest('Updater', 'no hardcoded installed-version fallback',
+    !/return "1\.0\.\d+"/.test(updateManagerSrc)
+    && updateManagerSrc.includes('BuildConfig.VERSION_NAME'));
+
+  logTest('Updater', 'the archive signer falls back to legacy signatures on quirky ROMs',
+    updateVerifierSrc.includes('preferSigningCertificates')
+    && updateVerifierSrc.includes('info.signatures'));
+
+  // Leak guards. Everything here runs on a thread or a handler that outlives the screen, so a
+  // strong Activity capture is a leak by construction; the fixes are weak references plus
+  // explicit removal, and these checks are what keep them that way.
+  logTest('Memory', 'background update work reaches the activity weakly',
+    (updateManagerSrc.match(
+      /final WeakReference<Activity> activityRef = new WeakReference<>\(activity\);/g) || []).length >= 2
+    && (updateManagerSrc.match(/updateExecutor\.execute/g) || []).length >= 2);
+
+  logTest('Memory', 'the static progress dialog is a weak reference',
+    updateManagerSrc.includes('WeakReference<AlertDialog> activeProgressDialog'));
+
+  logTest('Memory', 'the static blob-lock owner is a weak reference',
+    downloadSrc.includes('WeakReference<WebView> blobLockOwner'));
+
+  logTest('Memory', 'the queued blob poll is removable, not just time-bounded',
+    downloadSrc.includes('cancelPendingBlobPoll')
+    && downloadSrc.includes('MAIN_HANDLER.removeCallbacks')
+    && downloadSrc.includes('activity.isDestroyed()'));
+
+  logTest('Memory', 'the connectivity probe does not outlive the activity it woke for',
+    mainActivitySrc.includes('WeakReference<MainActivity> self')
+    && mainActivitySrc.includes('host == null || host.destroyed'));
+
+  logTest('Memory', 'every WebView created by the shell is destroyed on the way out',
+    (() => {
+      const destroys = (mainActivitySrc.match(/\.destroy\(\)/g) || []).length;
+      return destroys >= 3
+        && mainActivitySrc.includes('popupWindows.clear()')
+        && /onDestroy\(\)[\s\S]*webView = null;/.test(mainActivitySrc);
+    })());
+
+  // Retention is only half of "uses too much memory": a single oversized allocation can trip the
+  // per-app heap limit on its own, so the one unbounded write path keeps its copy bounded by a
+  // fixed buffer and re-checks the ceiling while it copies.
+  logTest('Memory', 'download writes peak at a buffer, not at the payload size',
+    /copyCapped\(InputStream source, OutputStream target\)/.test(downloadSrc)
+    && downloadSrc.includes('byte[] buffer = new byte[64 * 1024];')
+    && downloadSrc.includes('Payload exceeded the download ceiling')
+    && !/out\.write\(data\);/.test(downloadSrc));
+
+  logTest('Updater', 'documented check interval matches the code',
+    (() => {
+      const constant = /CHECK_INTERVAL_MS\s*=\s*(\d+)L?\s*\*\s*60L?\s*\*\s*1000L/.exec(updateManagerSrc);
+      if (!constant) {
+        return false;
+      }
+      const minutes = Number(constant[1]);
+      // PRIVACY.md is a disclosure document: it must state the real cadence, not an older one.
+      return privacySrc.includes(`${minutes} minutes`) && !privacySrc.includes('24 hours');
+    })());
 
   // --- Suite 9: Release engineering ---
   console.log('\n▶ SUITE 9: Release Engineering');
@@ -435,9 +827,21 @@ async function runAllTests() {
   logTest('Manifest', 'Data extraction rules block cloud backup and device transfer',
     manifestSrc.includes('dataExtractionRules') && fs.existsSync(path.join(resDir, 'xml', 'data_extraction_rules.xml')));
 
-  logTest('Legal', 'License and NOTICE are bundled inside the APK',
+  // Named for what it actually inspects. The old name promised "inside the APK" while only
+  // looking at the source tree, which is why a released binary with no bundled licence text
+  // still passed. The artifact-side check lives in Suite 10 and warns about exactly that.
+  logTest('Legal', 'License and NOTICE are staged for packaging in src/main/assets',
     fs.existsSync(path.join(srcDir, 'assets', 'LICENSE.txt'))
     && fs.existsSync(path.join(srcDir, 'assets', 'NOTICE.txt')));
+
+  logTest('Legal', 'NOTICE lists only dependencies the app actually declares',
+    (() => {
+      const notice = fs.readFileSync(path.join(projectRoot, 'NOTICE'), 'utf8');
+      const deps = buildGradleSrc;
+      const mentionsMaterial = /Material Components/i.test(notice);
+      const dependsOnMaterial = /com\.google\.android\.material|material:/.test(deps);
+      return mentionsMaterial === dependsOnMaterial;
+    })());
 
   logTest('Legal', 'Privacy policy and security policy disclose the install permission',
     privacySrc.includes('REQUEST_INSTALL_PACKAGES') && securitySrc.includes('REQUEST_INSTALL_PACKAGES'));
@@ -460,6 +864,15 @@ async function runAllTests() {
     } catch (err) {
       return false;
     }
+  })());
+
+  logTest('Metadata', 'documents quote the real audit-suite check count', (() => {
+    // Each document has to carry the number itself — either as "N-check suite" or as the
+    // "N / N Passing" score line — so no doc can keep advertising an old run.
+    const docs = ['RELEASE.md', 'test.sh', 'ANALYSIS_REPORT.md'].map((name) =>
+      fs.readFileSync(path.join(projectRoot, name), 'utf8'));
+    return docs.every((text) => text.includes(`${EXPECTED_CHECK_COUNT}-check`)
+      || text.includes(`${EXPECTED_CHECK_COUNT} / ${EXPECTED_CHECK_COUNT}`));
   })());
 
   logTest('Metadata', 'Gradle versionName matches package.json', (() => {
@@ -528,14 +941,98 @@ async function runAllTests() {
     const sumsMatch = sumsLines.length > 0
       && sumsLines[0].trim().split(/\s+/)[0].toLowerCase() === apkHash;
 
+    const entries = listZipEntries(apkBuffer);
+    const ids = signingBlockIds(apkBuffer);
+    const hasV2 = ids.includes(APK_SIGNATURE_SCHEME_V2_BLOCK_ID);
+    const hasV3 = ids.includes(APK_SIGNATURE_SCHEME_V3_BLOCK_ID)
+      || ids.includes(APK_SIGNATURE_SCHEME_V31_BLOCK_ID);
+    const digests = verifyJarDigests(apkBuffer, entries);
+
     logTest('Artifact', 'Committed APK SHA-256 matches SHA256SUMS', sumsMatch);
     logTest('Artifact', 'README publishes the same SHA-256 as the committed APK', readmeSrc.includes(apkHash));
     logTest('Artifact', 'All uncompressed APK entries are 4-byte aligned',
       zipInfo !== null && zipInfo.stored > 0 && zipInfo.misaligned === 0);
-    logTest('Artifact', 'APK contains an APK Signature Scheme v2 block',
-      apkBuffer.includes(Buffer.from('APK Sig Block 42'))
-      && apkBuffer.includes(Buffer.from([0x1a, 0x87, 0x09, 0x71])));
-    logTest('Artifact', 'APK package is ai.arena.mobile', apkBuffer.includes(Buffer.from('ai.arena.mobile', 'utf16le')));
+    logTest('Artifact', 'APK contains an APK Signature Scheme v2 block', hasV2);
+    logTest('Artifact', 'APK package is ai.arena.mobile',
+      apkBuffer.includes(Buffer.from('ai.arena.mobile', 'utf16le')));
+
+    // Everything below reads the archive instead of the source text. A build file can say
+    // anything it likes; these are the checks that describe what was actually shipped.
+    logTest('Artifact', 'APK v1 (JAR) digests recompute for every entry',
+      digests.checked > 300 && digests.mismatches === 0);
+
+    const certEntry = entries.find((e) => /\.(RSA|DSA|EC)$/i.test(e.name));
+    let apkFingerprint = null;
+    if (certEntry) {
+      try {
+        apkFingerprint = certificateFingerprint(readZipEntry(apkBuffer, certEntry));
+      } catch (err) {
+        apkFingerprint = null;
+      }
+    }
+    logTest('Artifact', 'APK signing certificate matches the README fingerprint',
+      apkFingerprint !== null && readmeSrc.includes(apkFingerprint));
+    logTest('Artifact', 'APK signing certificate matches the certificate release.yml pins',
+      apkFingerprint !== null && (() => {
+        const pin = /EXPECTED_CERT_SHA256:\s*"([0-9A-Fa-f:]+)"/.exec(releaseSrc);
+        return pin !== null
+          && pin[1].toUpperCase().replace(/:/g, '') === apkFingerprint.replace(/:/g, '').toUpperCase();
+      })());
+
+    const sourceVersionMatch = /versionName "([^"]+)"/.exec(buildGradleSrc);
+    const sourceVersion = sourceVersionMatch ? sourceVersionMatch[1] : null;
+    const documented = /\|\s*\*\*Version\*\*\s*\|\s*`(\d+\.\d+(?:\.\d+)?)\s+\(versionCode\s*(\d+)\)`/
+      .exec(readmeSrc);
+    const manifestEntry = entries.find((e) => e.name === 'AndroidManifest.xml');
+    let manifestBytes = Buffer.alloc(0);
+    try {
+      manifestBytes = readZipEntry(apkBuffer, manifestEntry);
+    } catch (err) {
+      manifestBytes = Buffer.alloc(0);
+    }
+    const apkContainsVersion = (version) =>
+      manifestBytes.includes(Buffer.from(version, 'utf16le'));
+
+    logTest('Artifact', 'APK version matches the version README documents for that artifact',
+      documented !== null && apkContainsVersion(documented[1]));
+    logTest('Artifact',
+      'committed APK is current, or disclosed as a historical artifact',
+      (() => {
+        if (!documented || sourceVersion === null) {
+          return false;
+        }
+        if (documented[1] === sourceVersion) {
+          // The README presents the binary as current: then it had better be current.
+          return apkContainsVersion(sourceVersion);
+        }
+        // Older than the tree. Acceptable only with an explicit disclosure next to the
+        // specification table, so no reader mistakes the artifact for the current build.
+        return apkContainsVersion(documented[1])
+          && !apkContainsVersion(sourceVersion)
+          && /Source on this branch is \*\*v/.test(readmeSrc);
+      })());
+
+    logTest('Artifact', 'Documented signature schemes match the APK signing block',
+      hasV3
+        ? /v1[^\n]*v2[^\n]*v3/.test(readmeSrc)
+        : /v1[^\n]*\+[^\n]*v2\b[^\n|]*(?:artifact|v1\.0)/i.test(readmeSrc)
+          || readmeSrc.includes('v1 (JAR) + v2'));
+
+    // Not a verdict, a heads-up: things the shipped binary is missing that the source already
+    // provides. It cannot be fixed by editing this repository (only a build can), so it warns
+    // instead of failing — but it must never be silently true.
+    const missingAssets = ['assets/LICENSE.txt', 'assets/NOTICE.txt']
+      .filter((name) => !entries.some((e) => e.name === name));
+    if (sourceVersion && !apkContainsVersion(sourceVersion)) {
+      console.log(`  ⚠️  WARNING  committed APK is ${documented ? documented[1] : 'an older'} build, source is ${sourceVersion}`);
+      console.log('     → releases/latest and the in-app updater still serve the older binary. Publish this source.');
+    }
+    if (!hasV3) {
+      console.log('  ⚠️  WARNING  committed APK has no APK Signature Scheme v3 block (v1 + v2 only).');
+    }
+    if (missingAssets.length > 0) {
+      console.log(`  ⚠️  WARNING  committed APK does not bundle: ${missingAssets.join(', ')}`);
+    }
   } else {
     logTest('Artifact', 'Committed APK present', false);
   }
@@ -593,4 +1090,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runAllTests };
+module.exports = { EXPECTED_CHECK_COUNT, runAllTests };
